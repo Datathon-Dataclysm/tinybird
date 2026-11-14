@@ -56,3 +56,28 @@ def insert(table: str, rows: list[Record], timeout: float = 10) -> None:
 def to_epoch(ts: str) -> float:
     """'2026-11-14 11:46:02.371000000' (UTC) -> unix seconds. Fast enough to call per row."""
     return calendar.timegm(time.strptime(ts[:19].replace("T", " "), "%Y-%m-%d %H:%M:%S"))
+
+
+def be_nice() -> None:
+    """Offline jobs (training, analysis) run at low CPU priority so they never slow down the live process on the
+    same machine: a late answer is a lost answer."""
+    try:
+        if os.name == "nt":
+            import ctypes
+            BELOW_NORMAL = 0x00004000
+            ctypes.windll.kernel32.SetPriorityClass(ctypes.windll.kernel32.GetCurrentProcess(), BELOW_NORMAL)
+        else:
+            os.nice(10)
+    except Exception:
+        pass
+
+
+def be_first() -> None:
+    """The live process runs at high CPU priority: its answers must never wait behind training or analysis."""
+    try:
+        if os.name == "nt":
+            import ctypes
+            ABOVE_NORMAL = 0x00008000
+            ctypes.windll.kernel32.SetPriorityClass(ctypes.windll.kernel32.GetCurrentProcess(), ABOVE_NORMAL)
+    except Exception:
+        pass

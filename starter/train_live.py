@@ -1,7 +1,7 @@
 """Learn from the live stream: train the ranker on what the live simulator actually did with our lists.
 
     python starter/train_live.py              # replay the day, train variants, compare them on the latest requests
-    python starter/train_live.py --final      # same, then train the best variant on ALL live rows -> models/ranker_v4*.txt
+    python starter/train_live.py --final      # same, then train the best variant on ALL live rows -> models/ranker_v6.txt
 
 Why: the live shoppers do not behave like the history said (e.g. a product the shopper already bought is almost
 never bought again live, while history suggested the opposite). team_NN.feedback tells, for every request,
@@ -29,12 +29,10 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from model import CATEGORICAL, FEATURES, TREND_HOURS, Recommender, Store, request_from_row  # noqa: E402
-from rawtree import ROOT, TEAM, query_df, to_epoch  # noqa: E402
+from rawtree import ROOT, TEAM, be_nice, query_df, to_epoch  # noqa: E402
 from train import auc, cached  # noqa: E402
 
 MODELS = ROOT / "models"
-ATTR_FEATURES = ["attr_lift_mean", "attr_lift_min", "attr_lift_max", "attr_views_match"]   # added in v5
-NO_ATTR = [i for i, f in enumerate(FEATURES) if f not in ATTR_FEATURES]    # the v4 feature set
 
 
 def fetch_live() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
@@ -109,10 +107,9 @@ def replay(store: Store, events: pd.DataFrame, updates: pd.DataFrame, fb: pd.Dat
             store.apply_catalog_update(up[i_up][1])
             i_up += 1
         while arrived and arrived[0][0] < now:          # our feedback becomes visible a few seconds later
-            _, u, c, b = heapq.heappop(arrived)
-            row_cs = store.live_cs.setdefault(u, {}).setdefault(c, [0.0, 0.0])
-            row_cs[0] += 1
-            row_cs[1] += b
+            _, u, c = heapq.heappop(arrived)
+            clicks = store.live_cs.setdefault(u, {})
+            clicks[c] = clicks.get(c, 0.0) + 1
         if now >= next_pop:                              # live refreshes popularity every 5 min
             keys = set(store.pop_raw) | set(live_counts)
             df = pd.DataFrame([(p, *(np.add(store.pop_raw.get(p, [0, 0, 0]), live_counts.get(p, [0, 0, 0]))))
@@ -133,15 +130,15 @@ def replay(store: Store, events: pd.DataFrame, updates: pd.DataFrame, fb: pd.Dat
         for p in shown:                                  # after the features: "times shown BEFORE this request"
             store.shown[row.user_id][p] += 1
         if row.clicked:
-            heapq.heappush(arrived, (row.ft, row.user_id, row.clicked, float(row.purchased == row.clicked)))
+            heapq.heappush(arrived, (row.ft, row.user_id, row.clicked))
         if k % 20000 == 0:
             print(f"  replayed {k:,}/{len(fb):,} requests ({time.time() - t0:.0f}s)", flush=True)
     return np.vstack(X), np.array(y_buy, float), np.array(y_click, float)
 
 
 PARAMS = dict(objective="binary", learning_rate=0.03, num_leaves=15, min_data_in_leaf=300, feature_fraction=0.8,
-              bagging_fraction=0.8, bagging_freq=1, lambda_l2=5.0, verbose=-1, seed=7)
-PARAMS_SMALL = dict(PARAMS, num_leaves=7, min_data_in_leaf=40, lambda_l2=10.0)   # buy | click: few rows
+              bagging_fraction=0.8, bagging_freq=1, lambda_l2=5.0, verbose=-1, seed=7,
+              num_threads=3)   # leave cores to the live process
 
 
 def fit(X, y, w=None, cols=None, params=PARAMS, rounds: int | None = None):
@@ -167,40 +164,23 @@ def top1(scores: np.ndarray, y: np.ndarray, n_per: int = 10) -> float:
     return float((t[has, s[has].argmax(1)] == 1).mean()) if has.any() else float("nan")
 
 
-def variants(X, yb, yc):
-    """Every candidate way of scoring: name -> (train function, predict function)."""
-    mix_w = lambda y: np.where(y == 1, 3.0, 1.0)  # noqa: E731
-
-    def v4(Xt, b, c):
-        m = fit(Xt, b, cols=NO_ATTR)
-        return [m], lambda Z: m.predict(Z[:, NO_ATTR])
-
-    def mix_new(Xt, b, c):
-        m = fit(Xt, np.maximum(c, b), mix_w(b))
-        return [m], lambda Z: m.predict(Z)
-
-    def purchase(Xt, b, c):
-        m = fit(Xt, b)
-        return [m], lambda Z: m.predict(Z)
-
-    def two_stage(Xt, b, c):
-        mc = fit(Xt, c)
-        clicked = c == 1
-        mb = fit(Xt[clicked], b[clicked], params=PARAMS_SMALL)
-        return [mc, mb], lambda Z: mc.predict(Z) * mb.predict(Z)
-
-    return {"v4-raven (purchase, no attributes)": v4, "v5: purchase + attributes": purchase,
-            "v5: click+3x buy + attributes": mix_new, "v5: two-stage + attributes": two_stage}
+# Training targets compared on every run. "click + 3x purchase": clicks give 3x more positives and teach what
+# attracts the shopper, purchases (weighted 3x) what they actually buy -- the most stable choice so far.
+TARGETS = {
+    "click + 3x purchase": lambda b, c: (np.maximum(c, b), np.where(b == 1, 3.0, 1.0)),
+    "purchase only": lambda b, c: (b, None),
+}
 
 
 def main() -> None:
+    be_nice()
     ap = argparse.ArgumentParser()
     ap.add_argument("--final", action="store_true", help="train the best variant on all live rows and save it")
-    ap.add_argument("--out", default="ranker_v5", help="model file name (without .txt)")
+    ap.add_argument("--out", default="ranker_v6", help="model file name (without .txt)")
     args = ap.parse_args()
 
     print("history store (everything before the event) ...")
-    store = cached("store_v3_all", lambda: Store.load(until=None))
+    store = cached("store_v6_all", lambda: Store.load(until=None))
     store.live_cs, store.shown = {}, defaultdict(Counter)
     print("live data ...")
     events, updates, fb = cached(f"live_{time.strftime('%Y%m%d%H')}", fetch_live)
@@ -216,46 +196,26 @@ def main() -> None:
     print(f"\ntrain {cut // 10:,} requests ({int(yb[:cut].sum())} purchases, {int(yc[:cut].sum())} clicks) | "
           f"test {(len(yb) - cut) // 10:,} requests ({int(yb[cut:].sum())} purchases)")
     results, trained = {}, {}
-    for name, train_fn in variants(X, yb, yc).items():
-        models, predict = train_fn(Xtr, yb[:cut], yc[:cut])
-        s = predict(Xte)
-        trained[name] = (train_fn, models)
-        results[name] = {"AUC purchase": auc(s, yb[cut:]), "AUC click": auc(s, yc[cut:]),
-                         "top1 purchase": top1(s, yb[cut:])}
+    for name, target in TARGETS.items():
+        y, w = target(yb[:cut], yc[:cut])
+        m = fit(Xtr, y, w)
+        s = m.predict(Xte)
+        trained[name] = m
+        results[name] = {"AUC purchase": auc(s, yb[cut:]), "AUC click": auc(s, yc[cut:]), "top1 purchase": top1(s, yb[cut:])}
     table = pd.DataFrame(results).T
     print(table.round(3).to_string())
-
     best = table["AUC purchase"].idxmax()
-    print(f"\nbest: {best}")
-    first = trained[best][1][0]
-    imp = pd.Series(first.feature_importance("gain"), index=first.feature_name()).sort_values(ascending=False)
-    print("feature importance % (first model of the best variant):")
-    print((100 * imp / imp.sum()).round(1).head(15).to_string())
+    imp = pd.Series(trained[best].feature_importance("gain"), index=FEATURES).sort_values(ascending=False)
+    print(f"\nbest: {best}; feature importance %:")
+    print((100 * imp / imp.sum()).round(1).to_string())
 
-    if args.final:
-        save_final(best, X, yb, yc, trained[best][1], args.out)
-
-
-def save_final(best: str, X, yb, yc, models, out: str) -> None:
-    """Retrain the chosen variant on ALL live rows (same number of trees) and write it atomically."""
-    main_path, buy_path = MODELS / f"{out}.txt", MODELS / f"{out}_buy.txt"
-    if "two-stage" in best:
-        mc = fit(X, yc, rounds=max(models[0].best_iteration, 50))
-        clicked = yc == 1
-        mb = fit(X[clicked], yb[clicked], params=PARAMS_SMALL, rounds=max(models[1].best_iteration, 30))
-        mb.save_model(str(buy_path.with_suffix(".tmp")))
-        os.replace(buy_path.with_suffix(".tmp"), buy_path)
-        final = mc
-    else:
-        y = np.maximum(yc, yb) if "click+3x" in best else yb
-        w = np.where(yb == 1, 3.0, 1.0) if "click+3x" in best else None
-        final = fit(X, y, w, rounds=max(models[0].best_iteration, 50))
-        if buy_path.exists():
-            buy_path.unlink()
-    final.save_model(str(main_path.with_suffix(".tmp")))
-    os.replace(main_path.with_suffix(".tmp"), main_path)   # the live process reloads when this file changes
-    print(f"saved {main_path.name}" + (f" + {buy_path.name}" if buy_path.exists() else "") +
-          f" ({len(yb) // 10:,} live requests)")
+    if args.final:                                   # same target and number of trees, on ALL live requests
+        y, w = TARGETS[best](yb, yc)
+        final = fit(X, y, w, rounds=max(trained[best].best_iteration, 50))
+        path = MODELS / f"{args.out}.txt"
+        final.save_model(str(path.with_suffix(".tmp")))
+        os.replace(path.with_suffix(".tmp"), path)  # atomic: the live process reloads when this file changes
+        print(f"saved {path.name} ({len(yb) // 10:,} live requests)")
 
 
 if __name__ == "__main__":
