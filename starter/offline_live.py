@@ -2,6 +2,8 @@
 
     python starter/offline_live.py ablation     # which feature groups matter? (replayed live feedback, AUC purchase)
     python starter/offline_live.py recall       # do our candidates contain what shoppers actually buy?
+    python starter/offline_live.py carousel     # same, for the purchases our carousel actually made (v6 vs v7 rules)
+    python starter/offline_live.py e2e          # full pipeline per version: real purchases in our top 10 / top 3
 
 ablation: the day is replayed once (point-in-time features, see train_live.py) and cached; then the ranker is retrained
           without each feature group and evaluated on the latest 25% of requests.
@@ -19,13 +21,15 @@ import numpy as np
 import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from model import FEATURES, Recommender, Store  # noqa: E402
+from collections import Counter, defaultdict
+
+from model import FEATURES, Ranker, Recommender, Store  # noqa: E402
 from rawtree import ROOT, be_nice, query_df, to_epoch  # noqa: E402
 from train import auc, cached  # noqa: E402
 from train_live import fetch_live, fit, replay, top1  # noqa: E402
 
 GROUPS = {
-    "session": ["in_views", "ses_cat", "ses_attr", "attr_views_match"],
+    "session": ["in_views", "ses_cat", "ses_subcat", "ses_attr", "attr_views_match", "coview", "n_views"],
     "user x product": ["ui_buys", "ui_carts", "days_since_buy", "days_since_cart"],
     "carousel": ["cs_clicks"],
     "taste (affinity)": ["aff_cat", "aff_subcat", "aff_attr", "aff_attr_min", "attr_lift_mean"],
@@ -36,7 +40,7 @@ GROUPS = {
 
 
 def history_store() -> Store:
-    return cached("store_v6_all", lambda: Store.load(until=None))
+    return cached("store_v7_all", lambda: Store.load(until=None))
 
 
 def replayed():
@@ -48,7 +52,7 @@ def replayed():
         print(f"  {len(fb):,} requests, {int((fb.purchased != '').sum())} purchases")
         X, yb, yc = replay(store, events, updates, fb)
         return X.astype(np.float32), yb, yc
-    return cached(f"replay_v6b_{time.strftime('%Y%m%d%H')}", build)
+    return cached(f"replay_v7_{time.strftime('%Y%m%d%H')}", build)
 
 
 def evaluate(cols, Xtr, ytr_b, ytr_c, Xte, yte_b, yte_c) -> dict:
@@ -187,6 +191,138 @@ def tune(k: int = 150) -> None:
     print(df.head(10).round(3).to_string(index=False))
 
 
+def carousel_recall(n: int = 3000) -> None:
+    """Products our carousel actually SOLD (team feedback): would each generator have proposed them?
+    Rebuilt from the request (views, user, page) with the history store, so it measures the candidate rules."""
+    from rawtree import TEAM
+    store = history_store()
+    df = query_df(f"""
+        SELECT r.request_id AS request_id, r.ts AS ts, r.user_id AS user_id, r.is_new_user AS is_new_user,
+               r.page AS page, r.recent_views AS recent_views, f.purchased AS purchased, s.mv AS mv
+        FROM (SELECT request_id::String AS request_id, purchased::String AS purchased FROM {TEAM}.feedback
+              WHERE purchased::String != '') AS f
+        INNER JOIN (SELECT request_id::String AS request_id, toString(ts::DateTime64(3)) AS ts, user_id::String AS user_id,
+                           is_new_user::Bool AS is_new_user, context.page::String AS page, recent_views FROM shop.requests) AS r
+            ON r.request_id = f.request_id
+        LEFT JOIN (SELECT request_id::String AS request_id, any(model_version::String) AS mv FROM {TEAM}.submissions
+                   GROUP BY request_id) AS s ON s.request_id = f.request_id
+        ORDER BY cityHash64(r.request_id) LIMIT {n}""")
+    full = Recommender(store)
+    v6 = Recommender(store)
+    v6.candidates = lambda ctx: _v6_candidates(v6, ctx)
+    gens = {"v6 (taste only)": v6, "v7 (session + taste)": full}
+    rows = []
+    for r in df.to_dict("records"):
+        ctx = full.context(r)
+        seg = "new" if r["is_new_user"] else ("home" if r["page"] == "home" else "returning, with views")
+        rows.append({"segment": seg, **{g: r["purchased"] in rec.candidates(ctx) for g, rec in gens.items()},
+                     **{f"{g} pool": len(rec.candidates(ctx)) for g, rec in gens.items()}})
+    t = pd.DataFrame(rows)
+    out = t.groupby("segment").agg(**{"purchases": ("segment", "size")},
+                                    **{g: (g, "mean") for g in gens}, **{f"{g} pool": (f"{g} pool", "mean") for g in gens})
+    out.loc["ALL"] = [len(t)] + [t[g].mean() for g in gens] + [t[f"{g} pool"].mean() for g in gens]
+    print(f"{len(t)} carousel purchases: share that each generator would have proposed")
+    print(out.round(3).to_string())
+
+
+def _v6_candidates(rec: Recommender, ctx) -> list[str]:
+    """The v6 candidate rules (taste family only), kept to measure the v7 fix."""
+    s, out, bought = rec.store, {}, ctx["bought"]
+
+    def add(items, limit):
+        n = 0
+        for p in items:
+            if n >= limit:
+                break
+            if p in s.subcat and p not in s.unavailable and p not in bought:
+                out.setdefault(p)
+                n += 1
+    ui, cs = ctx["ui"], ctx["cs"]
+    add(reversed(ctx["views"]), 20)
+    add(sorted((p for p in ui if ui[p][0] > 0), key=lambda p: -ui[p][2]), 15)
+    add(sorted(cs, key=lambda p: -cs[p]), 8)
+    add(rec.retrieve(ctx, 250), 250)
+    add(rec._new_products(ctx["now"]), 5)
+    add(s.top_global, 15)
+    return list(out)
+
+
+class _ColRanker(Ranker):
+    """A booster trained on a subset of FEATURES (to score an older feature set with today's feature matrix)."""
+    def __init__(self, booster, cols) -> None:
+        super().__init__(booster)
+        self.cols = cols
+
+    def score(self, X: np.ndarray) -> np.ndarray:
+        return self.booster.predict(X[:, self.cols])
+
+
+def end_to_end() -> None:
+    """Full pipeline (candidates + ranker) on the LAST 25% of the day: for every real carousel purchase, would each
+    version have put the purchased product in its top 10? Models are trained on the first 75% only, and the store
+    is replayed point-in-time (live events, new products, prices). Also: on no-cold category pages, the share of the
+    top 10 in the subcategory being browsed (the v6 symptom)."""
+    from train_live import TARGETS, V7_NEW
+    X, yb, yc = replayed()
+    cut = int(len(yb) // 10 * 0.75) * 10
+    y, w = TARGETS["click + 3x purchase"](yb[:cut], yc[:cut])
+    v6cols = [i for i, f in enumerate(FEATURES) if f not in V7_NEW]
+    print("training the v6-feature and v7-feature rankers on the first 75% ...")
+    m6, m7 = fit(X[:cut], y, w, cols=v6cols), fit(X[:cut], y, w)
+    store = history_store()
+    store.live_cs, store.shown = {}, defaultdict(Counter)
+    rec = Recommender(store)
+    pipes = {"v6 (cands v6 + model v6)": ("v6", _ColRanker(m6, v6cols)),
+             "v7 cands + model v6": ("v7", _ColRanker(m6, v6cols)),
+             "v7 (cands v7 + model v7)": ("v7", _ColRanker(m7, list(range(len(FEATURES)))))}
+    first_test = cut // 10
+    hits, mix = [], []
+
+    def top10(ctx, kind, ranker):
+        cands = _v6_candidates(rec, ctx) if kind == "v6" else rec.candidates(ctx)
+        scores = ranker.score(rec.features(ctx, cands))
+        return rec.fill([cands[i] for i in np.argsort(-scores, kind="stable")], 10, ctx["bought"])
+
+    def hook(k, row, ctx):
+        if k < first_test:
+            return
+        seg = ("cold" if row.is_new_user else f"no cold - {row.page}")
+        if row.purchased:
+            out = {"segment": seg}
+            for name, (kind, rk) in pipes.items():
+                top = top10(ctx, kind, rk)
+                out[name] = (top.index(row.purchased) + 1) if row.purchased in top else 0
+            hits.append(out)
+        elif seg == "no cold - category" and k % 5 == 0 and ctx["views"]:
+            vsc = {store.subcat.get(p) for p in ctx["views"]}
+            out = {}
+            for name, (kind, rk) in pipes.items():
+                top = top10(ctx, kind, rk)
+                out[name] = np.mean([store.subcat.get(p) in vsc for p in top])
+            mix.append(out)
+
+    events, updates, fb = cached(f"live_{time.strftime('%Y%m%d%H')}", fetch_live)
+    fb = fb[fb.shown.apply(len) == 10].reset_index(drop=True)
+    print("replaying the day point-in-time ...")
+    replay(store, events, updates, fb, hook=hook)
+    h = pd.DataFrame(hits)
+    names = list(pipes)
+    res = h.groupby("segment").agg(purchases=("segment", "size"),
+                                   **{f"{n} | hit@10": (n, lambda s: (s > 0).mean()) for n in names},
+                                   **{f"{n} | hit@3": (n, lambda s: s.between(1, 3).mean()) for n in names})
+    res.loc["ALL"] = [len(h)] + [(h[n] > 0).mean() for n in names] + [h[n].between(1, 3).mean() for n in names]
+    print()
+    print(f"{len(h)} carousel purchases in the last 25% of the day: share each pipeline would have put in its top 10 / 3")
+    for n in names:
+        print()
+        print(n)
+        print(res[["purchases", f"{n} | hit@10", f"{n} | hit@3"]].round(3).to_string())
+    print()
+    print(f"no-cold category pages ({len(mix)} sampled requests): share of the top 10 in the browsed subcategory")
+    print(pd.DataFrame(mix).mean().round(3).to_string())
+
+
 if __name__ == "__main__":
     be_nice()
-    {"ablation": ablation, "recall": recall, "tune": tune}[sys.argv[1] if len(sys.argv) > 1 else "ablation"]()
+    {"ablation": ablation, "recall": recall, "tune": tune, "carousel": carousel_recall,
+     "e2e": end_to_end}[sys.argv[1] if len(sys.argv) > 1 else "ablation"]()

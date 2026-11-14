@@ -1,6 +1,6 @@
 """Live recommender: the personalised model answering shop.requests in real time.
 
-    python starter/live.py --version v6          # production: write answers to team_NN.submissions
+    python starter/live.py --version v7          # production: write answers to team_NN.submissions
     python starter/live.py --shadow              # dry run: compute answers and measure, write NOTHING
 
 Only ONE production process per team: if two processes answer the same request, only one answer counts.
@@ -195,8 +195,8 @@ def _frac(ts: str) -> float:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--shadow", action="store_true", help="do not write submissions, only measure")
-    ap.add_argument("--version", default="v6", help="model_version written with each answer")
-    ap.add_argument("--model", default=str(ROOT / "models" / "ranker_v6.txt"))
+    ap.add_argument("--version", default="v7", help="model_version written with each answer")
+    ap.add_argument("--model", default=str(ROOT / "models" / "ranker_v7.txt"))
     args = ap.parse_args()
     if not args.shadow:
         be_first()                                   # answers before anything else running on this machine

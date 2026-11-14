@@ -72,8 +72,9 @@ def _epoch(t: str) -> float:
     return to_epoch(t) + (float("0." + t.split(".")[1]) if "." in t else 0.0)
 
 
-def replay(store: Store, events: pd.DataFrame, updates: pd.DataFrame, fb: pd.DataFrame):
-    """Walk the day in time order and build (features, labels) for every request as seen at that moment."""
+def replay(store: Store, events: pd.DataFrame, updates: pd.DataFrame, fb: pd.DataFrame, hook=None):
+    """Walk the day in time order and build (features, labels) for every request as seen at that moment.
+    hook(k, row, ctx), if given, is called for every request with the point-in-time context (offline tests)."""
     rec = Recommender(store)
     ev = sorted(zip((_epoch(t) for t in events.t), events.u, events.p, events.e), key=lambda x: x[0])
     up = [(to_epoch(r["t"]), r) for r in updates.to_dict("records")]
@@ -123,6 +124,8 @@ def replay(store: Store, events: pd.DataFrame, updates: pd.DataFrame, fb: pd.Dat
             store.set_trends(dict(live_by_sc), dict(ref_by_sc))
             next_trend = now + 60
         ctx = rec.context(request_from_row(row._asdict()))
+        if hook is not None:
+            hook(k, row, ctx)
         shown = list(row.shown)
         X.append(rec.features(ctx, shown, positions=list(range(len(shown)))))
         y_buy.extend(p == row.purchased for p in shown)
@@ -172,15 +175,36 @@ TARGETS = {
 }
 
 
+V7_NEW = ["ses_subcat", "coview", "n_views"]
+
+
+def segment_report(X: np.ndarray, yb: np.ndarray, yc: np.ndarray, scores: dict) -> pd.DataFrame:
+    """AUC purchase and top-1 per shopper segment (cold = new user; no cold split by page)."""
+    first = X[::10]
+    new, page = first[:, FEATURES.index("is_new_user")] == 1, first[:, FEATURES.index("page")]
+    segs = {"ALL": np.ones(len(first), bool), "cold (new user)": new,
+            "no cold - product": ~new & (page == 1), "no cold - category": ~new & (page == 2),
+            "no cold - home": ~new & (page == 0)}
+    rows = []
+    for seg, m in segs.items():
+        rows_m = np.repeat(m, 10)
+        row = {"segment": seg, "requests": int(m.sum()), "purchases": int(yb[rows_m].sum())}
+        for name, s in scores.items():
+            row[f"AUC {name}"] = auc(s[rows_m], yb[rows_m])
+            row[f"top1 {name}"] = top1(s[rows_m], yb[rows_m])
+        rows.append(row)
+    return pd.DataFrame(rows).set_index("segment").round(3)
+
+
 def main() -> None:
     be_nice()
     ap = argparse.ArgumentParser()
     ap.add_argument("--final", action="store_true", help="train the best variant on all live rows and save it")
-    ap.add_argument("--out", default="ranker_v6", help="model file name (without .txt)")
+    ap.add_argument("--out", default="ranker_v7", help="model file name (without .txt)")
     args = ap.parse_args()
 
     print("history store (everything before the event) ...")
-    store = cached("store_v6_all", lambda: Store.load(until=None))
+    store = cached("store_v7_all", lambda: Store.load(until=None))
     store.live_cs, store.shown = {}, defaultdict(Counter)
     print("live data ...")
     events, updates, fb = cached(f"live_{time.strftime('%Y%m%d%H')}", fetch_live)
@@ -195,16 +219,15 @@ def main() -> None:
     Xte[:, FEATURES.index("pos")] = 0                    # rank as if every product were in slot 1
     print(f"\ntrain {cut // 10:,} requests ({int(yb[:cut].sum())} purchases, {int(yc[:cut].sum())} clicks) | "
           f"test {(len(yb) - cut) // 10:,} requests ({int(yb[cut:].sum())} purchases)")
-    results, trained = {}, {}
-    for name, target in TARGETS.items():
-        y, w = target(yb[:cut], yc[:cut])
-        m = fit(Xtr, y, w)
-        s = m.predict(Xte)
-        trained[name] = m
-        results[name] = {"AUC purchase": auc(s, yb[cut:]), "AUC click": auc(s, yc[cut:]), "top1 purchase": top1(s, yb[cut:])}
-    table = pd.DataFrame(results).T
-    print(table.round(3).to_string())
-    best = table["AUC purchase"].idxmax()
+    best = "click + 3x purchase"                       # the best target in every run so far
+    y, w = TARGETS[best](yb[:cut], yc[:cut])
+    feature_sets = {"v6 features": [i for i, f in enumerate(FEATURES) if f not in V7_NEW], "v7 features": None}
+    trained, scores = {}, {}
+    for name, cols in feature_sets.items():
+        trained[name] = fit(Xtr, y, w, cols=cols)
+        scores[name] = trained[name].predict(Xte if cols is None else Xte[:, cols])
+    print(segment_report(Xte, yb[cut:], yc[cut:], scores).to_string())
+    trained = {best: trained["v7 features"]}
     imp = pd.Series(trained[best].feature_importance("gain"), index=FEATURES).sort_values(ascending=False)
     print(f"\nbest: {best}; feature importance %:")
     print((100 * imp / imp.sum()).round(1).to_string())

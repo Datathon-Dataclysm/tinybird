@@ -1,7 +1,7 @@
-"""Personalised recommender (v6): affinity retrieval -> features -> LightGBM ranker.
+"""Personalised recommender (v7): session + affinity retrieval -> features -> LightGBM ranker.
 
     store = Store.load(live=True)             # live: all history + today's shop.events / catalog_updates
-    model = Recommender(store, Ranker.load("models/ranker_v6.txt"))
+    model = Recommender(store, Ranker.load("models/ranker_v7.txt"))
     model.recommend(request)                  # -> 10 product ids, best first
 
 How the shop simulator decides (found in the data, see starter/offline_live.py):
@@ -11,11 +11,15 @@ How the shop simulator decides (found in the data, see starter/offline_live.py):
 - they almost never buy again something they already bought, and get tired of products shown again and again
 - popular products sell more; new products attract attention
 
-1. Candidates (~250): what the shopper just viewed, their carted / carousel-clicked products, and the top 250 of the
-   WHOLE catalogue by affinity (taste + session + popularity). Organic purchases fall in this pool ~62% of the time
-   (top 250, re-purchases excluded); the v5 hand-made rules reached ~44% (offline_live.py recall).
-2. Features (26, see FEATURES): affinity of the user and the session with the product's category / subcategory /
-   attributes, user x product history, popularity, freshness, fatigue, context.
+1. Candidates (~350), two families:
+   - session (what they browse NOW): viewed products, best sellers of the browsed subcategories, products co-viewed
+     with them, products sharing the browsed attributes, new products of those subcategories
+   - taste: carted / carousel-clicked products, and the top of the WHOLE catalogue by affinity (taste + popularity)
+   v6 used only the second family and lost the session: category-page and new-user conversion dropped (v7 fixes it).
+2. Features (29, see FEATURES): affinity of the user and the session with the product's category / subcategory /
+   attributes, co-views with the session, user x product history, popularity, freshness, fatigue, context.
+   v6 had dropped the session-subcategory and co-view features; putting them back moves real purchases into the
+   top 3 more often (54% -> 59%, offline_live.py e2e).
 3. Ranker: LightGBM trained on our live feedback (starter/train_live.py); products bought before are left out.
 """
 from __future__ import annotations
@@ -54,11 +58,11 @@ AFF_ALPHA = 10.0         # pseudo-events of the average shopper mixed into a use
 SES_ALPHA = 2.0          # same for the session profile (few views, but very informative)
 # Retrieval weights, tuned offline to put as many real purchases as possible in the top 150 (offline_live.py tune)
 W_SUBCAT, W_ATTR, W_SESSION, W_POP = 0.25, 1.0, 0.5, 0.6
-N_RETRIEVE = 250       # recall of real purchases: 150 -> 52%, 250 -> 62% (offline_live.py recall)
+N_RETRIEVE = 150       # top of the whole catalogue by affinity (on top of the session candidates)
 
 FEATURES = [
     "pos",                                                       # slot (training only; 0 at inference)
-    "in_views", "ses_cat", "ses_attr", "attr_views_match",       # session: what they are browsing now
+    "in_views", "ses_cat", "ses_subcat", "ses_attr", "attr_views_match", "coview", "n_views",   # session (now)
     "ui_buys", "ui_carts", "days_since_buy", "days_since_cart",  # user x product, organic
     "cs_clicks",                                                 # user x product, carousel
     "aff_cat", "aff_subcat", "aff_attr", "aff_attr_min", "attr_lift_mean",   # long-term taste
@@ -110,6 +114,7 @@ class Store:
                  ("user x subcategory", lambda: s._load_user_subcats(until)),
                  ("user x attribute", lambda: s._load_user_attrs(until)),
                  ("carousel history", lambda: s._load_carousel(until)),
+                 ("co-views", lambda: s._load_coviews(until)),
                  ("popularity", lambda: s.load_popularity(until, live))]
         if live:
             steps += [("live events", s._load_live_events), ("trends", s.load_trends)]
@@ -147,6 +152,12 @@ class Store:
         self.created = {p: to_epoch(c) for p, c in zip(cat.product_id, cat.created_at)}
         self.attrs = {p: parse_attrs(d) for p, d in zip(cat.product_id, cat.description)}
         self.cat_of_subcat = dict(zip(cat.subcategory, cat.category))
+        self.by_attr_pair: dict[tuple, list[str]] = defaultdict(list)          # (a, b) -> products with both
+        self.by_subcat: dict[str, list[str]] = defaultdict(list)               # subcategory -> products
+        for p, at in self.attrs.items():
+            self.by_subcat[self.subcat[p]].append(p)
+            if len(at) == 2:
+                self.by_attr_pair[at].append(p)
         self.unavailable = set(cat.product_id[~cat.is_active.astype(bool)]) | out
 
     def _load_user_items(self, until: str | None) -> None:
@@ -202,6 +213,18 @@ class Store:
         for u, p, c in zip(df.u, df.p, df.c):
             self.cs[u][p] = float(c)
 
+    def _load_coviews(self, until: str | None) -> None:
+        """For every product, the 20 products most viewed in the same organic sessions."""
+        df = query_df(f"""
+            SELECT a.product_id AS p, b.product_id AS q, count() AS n
+            FROM (SELECT session_id::String AS session_id, product_id::String AS product_id FROM shop.history_events
+                  WHERE event_type = 'view'{_until(until)}) AS a
+            INNER JOIN (SELECT session_id::String AS session_id, product_id::String AS product_id FROM shop.history_events
+                        WHERE event_type = 'view'{_until(until)}) AS b ON a.session_id = b.session_id
+            WHERE a.product_id != b.product_id
+            GROUP BY p, q ORDER BY n DESC LIMIT 20 BY p""")
+        self.coviews = df.groupby("p").q.apply(list).to_dict()
+
     def load_popularity(self, until: str | None = None, live: bool = False) -> None:
         """Views / carts / purchases per product over the last POP_DAYS days (history + live)."""
         end = f"toDateTime64('{until}', 3)" if until else "now64(3)"
@@ -225,7 +248,10 @@ class Store:
         tv, tb = (max(float(df[k].sum()), 1.0) / n for k in ("v", "b"))
         self.pop = {p: (v / tv, b / tb, (b + 0.1) / (v + 20.0), (c + 0.1) / (v + 20.0))
                     for p, v, c, b in zip(df.p, df.v.astype(float), df.c.astype(float), df.b.astype(float))}
-        self.top_global = df.sort_values(["b", "c", "v"], ascending=False).p.tolist()
+        ranked = df.sort_values(["b", "c", "v"], ascending=False)
+        self.top_global = ranked.p.tolist()
+        self.top_by_subcat = ranked.assign(sc=ranked.p.map(self.subcat)).groupby("sc", sort=False).p.apply(
+            lambda x: x.head(20).tolist()).to_dict()
 
     def load_trends(self) -> None:
         """Live: purchases per subcategory in the last TREND_HOURS vs the last week of history."""
@@ -300,7 +326,12 @@ class Store:
             self.subcat[p] = u["subcategory"]
             self.category[p] = u.get("category") or self.category.get(p)
         if u.get("description"):
-            self.attrs[p] = parse_attrs(u["description"])
+            at = parse_attrs(u["description"])
+            if p not in self.attrs and len(at) == 2:
+                self.by_attr_pair[at].append(p)
+            self.attrs[p] = at
+        if change == "new_product" and p not in self.by_subcat.get(self.subcat.get(p), []):
+            self.by_subcat[self.subcat.get(p)].append(p)
         if change == "new_product":
             self.created[p] = to_epoch(u["created_at"]) if u.get("created_at") else time.time()
         if change == "out_of_stock" or u.get("is_active") is False:
@@ -389,7 +420,7 @@ class Ranker:
 
 # ====================================================================================================== recommender
 class Recommender:
-    def __init__(self, store: Store, ranker: Ranker | None = None, n_candidates: int = 320,
+    def __init__(self, store: Store, ranker: Ranker | None = None, n_candidates: int = 400,
                  n_retrieve: int = N_RETRIEVE) -> None:
         self.store = store
         self.ranker = ranker or Ranker()
@@ -449,12 +480,16 @@ class Recommender:
         for a, n in v_attrs.items():
             ses_ua[a] = n
         ui = s.user_items(user)
+        coview: Counter = Counter()                                  # products co-viewed with the last 5 views
+        for k, p in enumerate(reversed(views[-5:])):
+            for rank, q in enumerate(s.coviews.get(p, [])):
+                coview[q] += 0.7 ** k / (rank + 1)
         is_new = req.get("is_new_user")
         if is_new is None:            # history rows don't carry the flag: new = no organic history at all
             is_new = user not in s.us_index
         return {
             "user": user, "now": to_epoch(ts) if isinstance(ts, str) else time.time(),
-            "views": views, "in_views": set(views), "v_attrs": v_attrs,
+            "views": views, "in_views": set(views), "v_attrs": v_attrs, "coview": coview,
             "ui": ui, "bought": {p for p, row in ui.items() if row[1] > 0}, "cs": s.carousel(user),
             "aff": self.profile(s.user_subcats(user), ua, AFF_ALPHA),
             "ses": self.profile(Counter(s.subcat.get(p) for p in views), ses_ua, SES_ALPHA),
@@ -493,11 +528,20 @@ class Recommender:
                     out.setdefault(p)
                     n += 1
 
-        ui, cs = ctx["ui"], ctx["cs"]
-        add(reversed(ctx["views"]), 20)                                                   # just viewed
+        ui, cs, views = ctx["ui"], ctx["cs"], ctx["views"]
+        pop_b = lambda p: -s.pop.get(p, (0, 0, 0, 0))[1]  # noqa: E731
+        # --- session: what they are browsing now (decisive on category pages and for new shoppers)
+        add(reversed(views), 20)                                                          # just viewed
+        for sc, _ in Counter(s.subcat.get(p) for p in views).most_common(3):             # browsed subcategories
+            add(s.top_by_subcat.get(sc, []), 10)
+            add(sorted(s.by_subcat.get(sc, []), key=lambda p: -s.created.get(p, 0))[:3], 3)   # their newest products
+        add((q for q, _ in ctx["coview"].most_common(40)), 40)                           # co-viewed with them
+        for a, b in _pairs([a for a, _ in ctx["v_attrs"].most_common(3)]):              # the browsed attributes
+            add(sorted(s.by_attr_pair.get(tuple(sorted((a, b))), []), key=pop_b), 6)
+        # --- taste: what they liked before + best affinity over the whole catalogue
         add(sorted((p for p in ui if ui[p][0] > 0), key=lambda p: -ui[p][2]), 15)       # in the cart
         add(sorted(cs, key=lambda p: -cs[p]), 8)                                          # clicked in the carousel
-        add(self.retrieve(ctx, self.n_retrieve), self.n_retrieve)                        # best affinity, whole catalogue
+        add(self.retrieve(ctx, self.n_retrieve), self.n_retrieve)
         add(self._new_products(ctx["now"]), 5)                                            # cold start: new products
         add(s.top_global, 15)                                                             # best sellers
         return list(out)[: self.n_candidates]
@@ -514,7 +558,7 @@ class Recommender:
     def features(self, ctx: dict[str, Any], cands: list[str], positions: list[int] | None = None) -> np.ndarray:
         s = self.store
         X = np.zeros((len(cands), len(FEATURES)), dtype=np.float64)
-        now, n_views = ctx["now"], max(len(ctx["views"]), 1)
+        now, n_views, coview = ctx["now"], max(len(ctx["views"]), 1), ctx["coview"]
         aff, ses, ratio, v_attrs = ctx["aff"], ctx["ses"], ctx["attr_ratio"], ctx["v_attrs"]
         shown = s.shown.get(ctx["user"], {})
         for i, p in enumerate(cands):
@@ -527,8 +571,11 @@ class Recommender:
                 positions[i] if positions else 0,
                 1.0 if p in ctx["in_views"] else 0.0,
                 ses["cat"][ic] if ic >= 0 else 0.0,
+                ses["sc"][isc] if isc >= 0 else 0.0,
                 sum(ses["attr"][a] for a in at),
                 sum(v_attrs.get(a, 0) for a in at) / n_views,
+                coview.get(p, 0.0),
+                len(ctx["views"]),
                 ui[1] if ui is not None else 0.0,
                 ui[0] if ui is not None else 0.0,
                 min((now - ui[3]) / DAY, NEVER) if ui is not None and ui[3] > 0 else NEVER,
@@ -545,6 +592,10 @@ class Recommender:
                 ctx["page"], ctx["device"], ctx["region"], ctx["is_new_user"],
             )
         return X
+
+
+def _pairs(items: list) -> list[tuple]:
+    return [(items[i], items[j]) for i in range(len(items)) for j in range(i + 1, len(items))]
 
 
 def request_from_row(row: Any) -> Record:
