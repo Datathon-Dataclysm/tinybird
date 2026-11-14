@@ -1,8 +1,8 @@
 """Live recommender: the personalised model answering shop.requests in real time.
 
     python starter/live.py --shadow                 # dry run: compute answers, measure, DO NOT write submissions
-    python starter/live.py --version v2             # production: write answers to team_NN.submissions
-    python starter/live.py --version v2 --adjust ab # production, A/B test of the price/trend adjustments by user
+    python starter/live.py --version v4             # production: write answers to team_NN.submissions
+    python starter/live.py --version v4 --adjust ab # production, A/B test of the new-product/trend multipliers
 
 Only ONE production process per team: if two processes answer the same request, only one answer counts.
 
@@ -10,7 +10,8 @@ Two threads:
 - main loop (every 0.25 s): pull new requests -> recommend (in memory, milliseconds) -> push one batch
 - refresher: keeps the in-memory store fresh without slowing the answers
     every 2 s   new shop.events          -> user x item / subcategory / brand tables (carts made a minute ago count)
-    every 5 s   new shop.catalog_updates -> new products, prices, stock-outs (an out-of-stock item invalidates a list)
+    every 1 s   new shop.catalog_updates -> new products, prices, stock-outs (stock-outs reach the table ~2 s late;
+                                            the organisers forgive the last 5 s, so 1 s polling keeps us inside)
     every 60 s  team feedback            -> what each shopper clicked / bought in our carousel (a strong signal)
     every 60 s  trends                   -> purchase share of each subcategory in the last 2 h vs usual
     every 5 min popularity of the last 7 days (history + live)
@@ -68,14 +69,16 @@ def log(msg: str) -> None:
 
 
 class Live:
-    def __init__(self, model_path: Path, version: str, shadow: bool, adjust: str = "on") -> None:
-        self.version, self.shadow, self.adjust = version, shadow, adjust
+    def __init__(self, model_path: Path, version: str, shadow: bool, adjust: str = "off",
+                 ab_candidates: bool = False) -> None:
+        self.version, self.shadow, self.adjust, self.ab_candidates = version, shadow, adjust, ab_candidates
         log("loading store (history + today's events), ~2 min ...")
         self.store = Store.load(live=True)
         ranker = Ranker.load(model_path) if model_path.exists() else Ranker()
         log(f"ranker: {model_path.name if model_path.exists() else 'heuristic (no model file found)'} | adjust: {adjust}")
         self.rec = Recommender(self.store, ranker, adjust=adjust != "off")
         self.rec_noadj = Recommender(self.store, ranker, adjust=False)
+        self.rec_narrow = Recommender(self.store, ranker, adjust=adjust == "on", wide=False)
         self.model_path = model_path
         self.model_mtime = model_path.stat().st_mtime if model_path.exists() else 0.0
         self.lock = threading.Lock()              # the refresher mutates the store, the main loop reads it
@@ -125,17 +128,19 @@ class Live:
             for r in reqs:
                 t = time.perf_counter()
                 rec, version = self.rec, self.version
-                if self.adjust == "ab":                      # stable half of the shoppers each
-                    if zlib.crc32(r["user_id"].encode()) % 2:
-                        rec, version = self.rec, f"{self.version}-adj"
-                    else:
-                        rec, version = self.rec_noadj, f"{self.version}-noadj"
+                half = zlib.crc32(r["user_id"].encode()) % 2  # stable half of the shoppers each
+                if self.adjust == "ab":                        # A/B of the live multipliers
+                    rec, version = (self.rec, f"{self.version}-adj") if half else (self.rec_noadj, f"{self.version}-noadj")
+                elif self.ab_candidates:                       # A/B of the candidate generation
+                    rec, version = (self.rec, f"{self.version}-wide") if half else (self.rec_narrow, f"{self.version}-narrow")
                 items = rec.recommend(r)
                 self.stats["compute_ms"].append(1000 * (time.perf_counter() - t))
                 if len(items) != 10 or len(set(items)) != 10 or any(p in self.store.unavailable for p in items):
                     self.stats["invalid"] += 1
                     items = self.rec.fill([], 10)            # never send an invalid list
                 self.seen[r["request_id"]] = time.time()
+                for p in items:                               # fatigue feature: times we showed it to this shopper
+                    self.store.shown[r["user_id"]][p] += 1
                 out.append({"request_id": r["request_id"], "items": items, "model_version": version})
                 if self.shadow:
                     base = [p for p in self.best if p not in self.store.unavailable][:10]
@@ -154,7 +159,7 @@ class Live:
 
     # ------------------------------------------------------------------ refresher thread
     def refresher(self) -> None:
-        jobs = [(2, self.refresh_events), (5, self.refresh_catalog), (60, self.refresh_carousel),
+        jobs = [(2, self.refresh_events), (1, self.refresh_catalog), (60, self.refresh_carousel),
                 (60, self.refresh_trends), (300, self.refresh_popularity), (30, self.reload_model)]
         if self.shadow:
             jobs.append((60, self.score_shadow))
@@ -219,7 +224,7 @@ class Live:
         if mtime == self.model_mtime:
             return
         ranker = Ranker.load(self.model_path)
-        self.rec.ranker = self.rec_noadj.ranker = ranker
+        self.rec.ranker = self.rec_noadj.ranker = self.rec_narrow.ranker = ranker
         self.model_mtime = mtime
         log(f"reloaded model {self.model_path.name}")
 
@@ -272,12 +277,14 @@ def _frac(ts: str) -> float:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--shadow", action="store_true", help="do not write submissions, only measure")
-    ap.add_argument("--version", default="v2", help="model_version written with each answer")
-    ap.add_argument("--model", default=str(ROOT / "models" / "ranker_live.txt"))
-    ap.add_argument("--adjust", choices=["on", "off", "ab"], default="on",
+    ap.add_argument("--version", default="v4", help="model_version written with each answer")
+    ap.add_argument("--model", default=str(ROOT / "models" / "ranker_v4.txt"))
+    ap.add_argument("--adjust", choices=["on", "off", "ab"], default="off",
                     help="live price-drop / trend multipliers: on, off, or A/B by user")
+    ap.add_argument("--ab-candidates", action="store_true",
+                    help="A/B by user: wide candidates (with category best sellers) vs the v3 candidates")
     args = ap.parse_args()
-    Live(Path(args.model), args.version, args.shadow, args.adjust).run()
+    Live(Path(args.model), args.version, args.shadow, args.adjust, args.ab_candidates).run()
 
 
 if __name__ == "__main__":

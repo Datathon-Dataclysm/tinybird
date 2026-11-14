@@ -53,6 +53,8 @@ FEATURES = [
     "us_share", "uc_share", "us_buy_share", "ub_buy_share", "has_history",
     # product (scale-free: 1.0 = an average product)
     "pop_views", "pop_carts", "pop_buys", "cvr", "cart_rate", "log_price", "price_vs_subcat", "age_days",
+    # live dynamics (learnt from the live replay; constant in the history)
+    "is_new_product", "discount", "trend", "times_shown",
     # context
     "page", "device", "region", "is_new_user",
 ]
@@ -81,7 +83,8 @@ class Store:
         self.live_us_buy: dict[str, Counter] = defaultdict(Counter)             # user -> subcategory -> purchases
         self.live_ub: dict[str, Counter] = defaultdict(Counter)                 # user -> brand -> purchases
         self.live_cs: dict[str, dict[str, list[float]]] = {}                    # user -> item -> [clicks, buys] (our feedback)
-        self.trend_sc: dict[str, float] = {}                                    # subcategory -> trend multiplier (live)
+        self.trend_sc: dict[str, float] = {}                                    # subcategory -> trend (live, 1 = usual)
+        self.shown: dict[str, Counter] = defaultdict(Counter)                   # user -> item -> times we showed it
         self.last_event_ts = ""
 
     # ------------------------------------------------------------------ loading
@@ -225,7 +228,9 @@ class Store:
         top_global = ranked.p.tolist()
         ranked = ranked.assign(sc=ranked.p.map(self.subcat))
         top_by_subcat = ranked.groupby("sc", sort=False).p.apply(lambda s: s.head(20).tolist()).to_dict()
-        self.pop, self.top_global, self.top_by_subcat = pop, top_global, top_by_subcat   # swap at once
+        ranked = ranked.assign(cc=ranked.p.map(self.category))
+        top_by_cat = ranked.groupby("cc", sort=False).p.apply(lambda s: s.head(40).tolist()).to_dict()
+        self.pop, self.top_global, self.top_by_subcat, self.top_by_cat = pop, top_global, top_by_subcat, top_by_cat
 
     def load_trends(self) -> None:
         """Live: purchase share of each subcategory in the last TREND_HOURS vs its share in the last week of history."""
@@ -240,11 +245,16 @@ class Store:
                     AND ts::DateTime64(3) > (SELECT max(ts::DateTime64(3)) FROM shop.history_events) - INTERVAL 7 DAY) AS e
             INNER JOIN (SELECT product_id::String AS p, subcategory::String AS subcategory FROM shop.catalog) AS c ON c.p = e.p
             GROUP BY sc""")
-        A, R = float(df.a.sum()), max(float(df.r.sum()), 1.0)
+        self.set_trends(dict(zip(df.sc, df.a.astype(float))), dict(zip(df.sc, df.r.astype(float))))
+
+    def set_trends(self, live_by_sc: dict, ref_by_sc: dict) -> None:
+        """Trend of each subcategory = purchases in the last TREND_HOURS / purchases expected from its usual share
+        (shrunk towards 1 when there is little data)."""
+        A, R = float(sum(live_by_sc.values())), max(float(sum(ref_by_sc.values())), 1.0)
         trend = {}
-        for sc, a, r in zip(df.sc, df.a.astype(float), df.r.astype(float)):
-            expected = A * r / R                                     # purchases if the subcategory kept its usual share
-            trend[sc] = float(np.clip((a + 20.0) / (expected + 20.0), 0.67, 2.0))
+        for sc in set(ref_by_sc) | set(live_by_sc):
+            expected = A * ref_by_sc.get(sc, 0.0) / R
+            trend[sc] = float(np.clip((live_by_sc.get(sc, 0.0) + 20.0) / (expected + 20.0), 0.5, 3.0))
         self.trend_sc = trend
 
     def _load_coviews(self, until: str | None) -> None:
@@ -356,24 +366,36 @@ class Store:
 
 
 class Ranker:
-    """LightGBM model predicting P(purchase) from FEATURES."""
+    """LightGBM ranker. One model -> its score. Two models (two-stage) -> P(click) x P(purchase | click):
+    the shopper clicks out of curiosity but buys out of affinity, so the two are learnt separately."""
 
-    def __init__(self, booster: Any = None) -> None:
+    def __init__(self, booster: Any = None, buy_booster: Any = None) -> None:
         self.booster = booster
+        self.buy_booster = buy_booster
 
-    @classmethod
-    def load(cls, path: str | Path) -> "Ranker":
+    @staticmethod
+    def _booster(path: Path):
         import lightgbm as lgb
         booster = lgb.Booster(model_file=str(path))
         if booster.feature_name() != FEATURES:   # an old model with other features would silently mis-score
-            raise ValueError(f"{path} was trained with other features; retrain it with starter/train.py")
-        return cls(booster)
+            raise ValueError(f"{path} was trained with other features; retrain it")
+        return booster
+
+    @classmethod
+    def load(cls, path: str | Path) -> "Ranker":
+        """`ranker_x.txt` (+ `ranker_x_buy.txt` if present: two-stage)."""
+        path = Path(path)
+        buy = path.with_name(path.stem + "_buy" + path.suffix)
+        return cls(cls._booster(path), cls._booster(buy) if buy.exists() else None)
 
     def score(self, X: np.ndarray) -> np.ndarray:
-        """A positive score (probability-like), so that live adjustments can multiply it."""
-        if self.booster is not None:
-            return self.booster.predict(X)
-        return np.exp(heuristic_score(X))
+        """A positive score (probability-like)."""
+        if self.booster is None:
+            return np.exp(heuristic_score(X))
+        s = self.booster.predict(X)
+        if self.buy_booster is not None:
+            s = s * self.buy_booster.predict(X)
+        return s
 
 
 def heuristic_score(X: np.ndarray) -> np.ndarray:
@@ -387,11 +409,12 @@ def heuristic_score(X: np.ndarray) -> np.ndarray:
 
 
 class Recommender:
-    def __init__(self, store: Store, ranker: Ranker | None = None, n_candidates: int = 200,
-                 adjust: bool = True) -> None:
+    def __init__(self, store: Store, ranker: Ranker | None = None, n_candidates: int = 260,
+                 adjust: bool = False, wide: bool = True) -> None:
         self.store = store
         self.ranker = ranker or Ranker()
         self.n_candidates = n_candidates
+        self.wide = wide                         # also best sellers of the browsed / liked *categories*
         self.adjust = adjust                     # live adjustments for price drops and trends
 
     # ------------------------------------------------------------------ public
@@ -510,6 +533,12 @@ class Recommender:
         for sc, _ in ctx["us"].most_common(3):                                            # long-term taste
             add(s.top_by_subcat.get(sc, []), 6)
             add(self._newest(sc), 2)
+        if self.wide:                     # live, the category (not the subcategory) is what drives purchases
+            top_by_cat = getattr(s, "top_by_cat", {})
+            for c, _ in (ctx["v_cats"] + Counter()).most_common(2):                       # browsed categories
+                add(top_by_cat.get(c, []), 15)
+            for c, _ in ctx["uc"].most_common(3):                                         # liked categories
+                add(top_by_cat.get(c, []), 10)
         add(s.top_global, 30)                                                             # best sellers
         return list(out)[: self.n_candidates]
 
@@ -535,6 +564,7 @@ class Recommender:
         now = ctx["now"]
         us_total, us_buy_total, ub_total = ctx["us_total"], ctx["us_buy_total"], ctx["ub_total"]
         has_history = 1.0 if us_total > 0 else 0.0
+        shown = s.shown.get(ctx["user"], {})
         for i, p in enumerate(cands):
             sc, cat, br = s.subcat.get(p), s.category.get(p), s.brand.get(p)
             ui = ctx["ui"].get(p)
@@ -566,6 +596,10 @@ class Recommender:
                 math.log1p(price),
                 price / s.subcat_price.get(sc, price or 1.0) if price else 1.0,
                 min((now - s.created.get(p, 0.0)) / DAY, 999.0),
+                1.0 if now - s.created.get(p, 0.0) < NEW_PRODUCT_DAYS * DAY else 0.0,
+                price / s.base_price.get(p, price) if price and s.base_price.get(p) else 1.0,
+                s.trend_sc.get(sc, 1.0),
+                shown.get(p, 0),
                 ctx["page"], ctx["device"], ctx["region"], ctx["is_new_user"],
             )
         return X
