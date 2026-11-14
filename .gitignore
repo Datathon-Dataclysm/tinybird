@@ -31,6 +31,8 @@ logs/
 # --- Models: keep only the production model, offline experiments are reproducible ---
 models/*
 !models/ranker.txt
+!models/ranker_v2.txt
+!models/ranker_live.txt
 
 # --- Agent / editor local files (skills are reinstalled with: npx skills add rawtreedb/agent-skills) ---
 .agents/

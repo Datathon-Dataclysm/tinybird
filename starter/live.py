@@ -1,17 +1,22 @@
 """Live recommender: the personalised model answering shop.requests in real time.
 
     python starter/live.py --shadow                 # dry run: compute answers, measure, DO NOT write submissions
-    python starter/live.py --version v1-lgbm        # production: write answers to team_NN.submissions
+    python starter/live.py --version v2             # production: write answers to team_NN.submissions
+    python starter/live.py --version v2 --adjust ab # production, A/B test of the price/trend adjustments by user
 
 Only ONE production process per team: if two processes answer the same request, only one answer counts.
 
 Two threads:
 - main loop (every 0.25 s): pull new requests -> recommend (in memory, milliseconds) -> push one batch
 - refresher: keeps the in-memory store fresh without slowing the answers
-    every 2 s   new shop.events          -> user x item / user x subcategory tables (carts made a minute ago count)
+    every 2 s   new shop.events          -> user x item / subcategory / brand tables (carts made a minute ago count)
     every 5 s   new shop.catalog_updates -> new products, prices, stock-outs (an out-of-stock item invalidates a list)
-    every 60 s  team feedback            -> products a shopper already bought from our carousel are not shown again
+    every 60 s  team feedback            -> what each shopper clicked / bought in our carousel (a strong signal)
+    every 60 s  trends                   -> purchase share of each subcategory in the last 2 h vs usual
     every 5 min popularity of the last 7 days (history + live)
+
+--adjust ab splits shoppers in two halves (by user id) and writes model_version "<version>-adj" / "<version>-noadj",
+so the dashboard compares them on the same traffic.
 
 Shadow mode also scores itself: for each request, did the shopper add to cart / buy (organically, shop.events)
 within 10 minutes a product that was in our list? And in the baseline's list? Printed every minute.
@@ -24,6 +29,7 @@ import sys
 import threading
 import time
 import traceback
+import zlib
 from collections import deque
 from pathlib import Path
 
@@ -50,10 +56,11 @@ SELECT product_id::String AS product_id, change::String AS change, category::Str
        is_active::Bool AS is_active, toString(created_at::DateTime64(3)) AS created_at, toString(ts::DateTime64(3)) AS t
 FROM shop.catalog_updates WHERE ts::DateTime64(3) > toDateTime64('{since}', 3) ORDER BY ts"""
 
-BOUGHT = f"""
-SELECT r.user_id::String AS u, f.purchased::String AS p
+CAROUSEL = f"""
+SELECT r.user_id::String AS u, f.clicked::String AS p, count() AS c,
+       countIf(f.purchased::String = f.clicked::String) AS b
 FROM {TEAM}.feedback AS f INNER JOIN shop.requests AS r ON r.request_id::String = f.request_id::String
-WHERE f.purchased::String != '' AND f.served_by::String = 'team'"""
+WHERE f.clicked::String != '' GROUP BY u, p"""
 
 
 def log(msg: str) -> None:
@@ -61,13 +68,16 @@ def log(msg: str) -> None:
 
 
 class Live:
-    def __init__(self, model_path: Path, version: str, shadow: bool) -> None:
-        self.version, self.shadow = version, shadow
-        log("loading store (history + today's events), ~1-2 min ...")
+    def __init__(self, model_path: Path, version: str, shadow: bool, adjust: str = "on") -> None:
+        self.version, self.shadow, self.adjust = version, shadow, adjust
+        log("loading store (history + today's events), ~2 min ...")
         self.store = Store.load(live=True)
         ranker = Ranker.load(model_path) if model_path.exists() else Ranker()
-        log(f"ranker: {model_path.name if model_path.exists() else 'heuristic (no model file found)'}")
-        self.rec = Recommender(self.store, ranker)
+        log(f"ranker: {model_path.name if model_path.exists() else 'heuristic (no model file found)'} | adjust: {adjust}")
+        self.rec = Recommender(self.store, ranker, adjust=adjust != "off")
+        self.rec_noadj = Recommender(self.store, ranker, adjust=False)
+        self.model_path = model_path
+        self.model_mtime = model_path.stat().st_mtime if model_path.exists() else 0.0
         self.lock = threading.Lock()              # the refresher mutates the store, the main loop reads it
         self.seen: dict[str, float] = {}          # request_id -> when we saw it (dedupe, pruned)
         self.recent_keys: deque = deque()         # event dedupe across overlapping polls
@@ -114,13 +124,19 @@ class Live:
         with self.lock:
             for r in reqs:
                 t = time.perf_counter()
-                items = self.rec.recommend(r)
+                rec, version = self.rec, self.version
+                if self.adjust == "ab":                      # stable half of the shoppers each
+                    if zlib.crc32(r["user_id"].encode()) % 2:
+                        rec, version = self.rec, f"{self.version}-adj"
+                    else:
+                        rec, version = self.rec_noadj, f"{self.version}-noadj"
+                items = rec.recommend(r)
                 self.stats["compute_ms"].append(1000 * (time.perf_counter() - t))
                 if len(items) != 10 or len(set(items)) != 10 or any(p in self.store.unavailable for p in items):
                     self.stats["invalid"] += 1
                     items = self.rec.fill([], 10)            # never send an invalid list
                 self.seen[r["request_id"]] = time.time()
-                out.append({"request_id": r["request_id"], "items": items, "model_version": self.version})
+                out.append({"request_id": r["request_id"], "items": items, "model_version": version})
                 if self.shadow:
                     base = [p for p in self.best if p not in self.store.unavailable][:10]
                     self.pending.append((r["request_id"], r["user_id"], to_epoch(r["ts"]), items, base))
@@ -138,8 +154,8 @@ class Live:
 
     # ------------------------------------------------------------------ refresher thread
     def refresher(self) -> None:
-        jobs = [(2, self.refresh_events), (5, self.refresh_catalog), (60, self.refresh_bought),
-                (300, self.refresh_popularity)]
+        jobs = [(2, self.refresh_events), (5, self.refresh_catalog), (60, self.refresh_carousel),
+                (60, self.refresh_trends), (300, self.refresh_popularity), (30, self.reload_model)]
         if self.shadow:
             jobs.append((60, self.score_shadow))
         last = {f: 0.0 for _, f in jobs}
@@ -179,18 +195,33 @@ class Live:
                     self.store.apply_catalog_update(u)
             self.updates_since = rows[-1]["t"]
 
-    def refresh_bought(self) -> None:
-        rows = query(BOUGHT, timeout=20)
-        with self.lock:
-            for r in rows:
-                self.store.bought_from_us[r["u"]].add(r["p"])
+    def refresh_carousel(self) -> None:
+        """What each shopper clicked / bought in our carousel today (feedback). Bought there -> often bought again."""
+        live: dict[str, dict[str, list[float]]] = {}
+        for r in query(CAROUSEL, timeout=20):
+            live.setdefault(r["u"], {})[r["p"]] = [float(r["c"]), float(r["b"])]
+        self.store.live_cs = live                    # swapped at once
+
+    def refresh_trends(self) -> None:
+        self.store.load_trends()
+        top = sorted(self.store.trend_sc.items(), key=lambda kv: -kv[1])[:3]
+        log("trending: " + ", ".join(f"{sc} x{t:.2f}" for sc, t in top))
 
     def refresh_popularity(self) -> None:
-        tmp = Store.__new__(Store)
-        tmp.subcat = self.store.subcat
-        tmp._load_popularity(None, live=True)
-        with self.lock:
-            self.store.pop, self.store.top_global, self.store.top_by_subcat = tmp.pop, tmp.top_global, tmp.top_by_subcat
+        self.store.load_popularity(None, live=True)
+
+    def reload_model(self) -> None:
+        """Hot reload: when the model file changes (e.g. train_live.py --final retrained it), swap it in
+        without restarting, so no request goes unanswered. A broken file is ignored and the old model stays."""
+        if not self.model_path.exists():
+            return
+        mtime = self.model_path.stat().st_mtime
+        if mtime == self.model_mtime:
+            return
+        ranker = Ranker.load(self.model_path)
+        self.rec.ranker = self.rec_noadj.ranker = ranker
+        self.model_mtime = mtime
+        log(f"reloaded model {self.model_path.name}")
 
     # ------------------------------------------------------------------ shadow scoring
     def score_shadow(self, horizon: float = 600) -> None:
@@ -241,13 +272,12 @@ def _frac(ts: str) -> float:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--shadow", action="store_true", help="do not write submissions, only measure")
-    ap.add_argument("--version", default="v1-lgbm", help="model_version written with each answer")
-    ap.add_argument("--model", default=str(ROOT / "models" / "ranker.txt"))
+    ap.add_argument("--version", default="v2", help="model_version written with each answer")
+    ap.add_argument("--model", default=str(ROOT / "models" / "ranker_live.txt"))
+    ap.add_argument("--adjust", choices=["on", "off", "ab"], default="on",
+                    help="live price-drop / trend multipliers: on, off, or A/B by user")
     args = ap.parse_args()
-    model = Path(args.model)
-    if not model.exists() and (ROOT / "models" / "ranker_offline.txt").exists():
-        model = ROOT / "models" / "ranker_offline.txt"
-    Live(model, args.version, args.shadow).run()
+    Live(Path(args.model), args.version, args.shadow, args.adjust).run()
 
 
 if __name__ == "__main__":

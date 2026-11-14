@@ -1,7 +1,7 @@
 """Train the LightGBM ranker on shop.history_sessions and evaluate it offline against the baseline.
 
-    python starter/train.py                  # offline experiment: train week -> test week, writes models/ranker.txt
-    python starter/train.py --final          # same, but trained on the most recent week (for the live system)
+    python starter/train.py                  # offline experiment: train week -> test week, writes models/ranker_offline.txt
+    python starter/train.py --final          # trained on the most recent week, for the live system: models/ranker_v2.txt
 
 Time split (no peeking into the future):
 
@@ -26,7 +26,7 @@ import numpy as np
 import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from model import FEATURES, Ranker, Recommender, Store, request_from_row  # noqa: E402
+from model import CATEGORICAL, FEATURES, Ranker, Recommender, Store, request_from_row  # noqa: E402
 from rawtree import ROOT, query_df  # noqa: E402
 
 CACHE = ROOT / ".cache"
@@ -54,7 +54,7 @@ def cached(name: str, build):
 
 def load_store(until: str) -> Store:
     print(f"store until {until}")
-    return cached(f"store_{until}", lambda: Store.load(until=until))
+    return cached(f"store_v2_{until}", lambda: Store.load(until=until))
 
 
 def sessions(start: str, end: str, sample: str) -> pd.DataFrame:
@@ -82,7 +82,7 @@ def train(X: np.ndarray, y: np.ndarray, g: np.ndarray, seed: int = 7):
     is_val = np.array([s in val for s in g])
     params = dict(objective="binary", learning_rate=0.05, num_leaves=31, min_data_in_leaf=200,
                   feature_fraction=0.8, bagging_fraction=0.8, bagging_freq=1, lambda_l2=1.0, verbose=-1, seed=seed)
-    dtrain = lgb.Dataset(X[~is_val], y[~is_val], feature_name=FEATURES)
+    dtrain = lgb.Dataset(X[~is_val], y[~is_val], feature_name=FEATURES, categorical_feature=CATEGORICAL)
     dval = lgb.Dataset(X[is_val], y[is_val], reference=dtrain)
     booster = lgb.train(params, dtrain, num_boost_round=1000, valid_sets=[dval],
                         callbacks=[lgb.early_stopping(50, verbose=False)])
@@ -142,7 +142,7 @@ def main() -> None:
     print(f"  {len(y):,} rows built in {time.time() - t:.0f}s")
     booster = train(X, y, g)
     MODELS.mkdir(exist_ok=True)
-    name = "ranker.txt" if args.final else "ranker_offline.txt"
+    name = "ranker_v2.txt" if args.final else "ranker_offline.txt"
     booster.save_model(str(MODELS / name))
     imp = pd.Series(booster.feature_importance("gain"), index=FEATURES).sort_values(ascending=False)
     print("  feature importance (gain, %):")

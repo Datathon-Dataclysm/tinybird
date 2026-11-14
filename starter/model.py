@@ -1,17 +1,19 @@
-"""Personalised recommender: candidates -> features -> ranker.
+"""Personalised recommender (v2): candidates -> features -> ranker -> live adjustments.
 
     store = Store.load(until="2026-11-07")    # offline: only data before the cut
     store = Store.load(live=True)             # live: all history + today's shop.events / catalog_updates
     model = Recommender(store, ranker=Ranker.load("models/ranker.txt"))
     model.recommend(request)                  # -> 10 product ids, best first
 
-1. Candidates (~100-200 per request): what the shopper just viewed, what they interacted with before
-   (user x item table), products co-viewed with their views, best sellers of the subcategories they
-   are browsing / like, and the global best sellers.
-2. Features per (request, candidate): session signals, user x item history, user x subcategory taste,
-   co-views, popularity and conversion of the product, price, context.
-3. Ranker: a LightGBM model trained on shop.history_sessions predicts P(purchase) for each candidate.
-   Without a trained model it falls back to a hand-weighted score.
+1. Candidates (~100-200 per request): what the shopper just viewed, what they bought / carted before (organic
+   and in the carousel), products co-viewed with their views, best sellers and new products of the subcategories
+   they browse or like, and the global best sellers.
+2. Features per (request, candidate), see FEATURES. They are *scale-free* (shares and ratios, not raw counts)
+   because the live stream is ~30x denser than the history: a count learnt on history would mean something else live.
+3. Ranker: LightGBM trained on shop.history_sessions predicts P(purchase) of each candidate.
+4. Live adjustments, for effects the history cannot teach (no price changes or trends in it):
+   - price drops: P x (base price / current price)^2, clipped to [0.5, 2.5]  (live: a ~19% drop -> ~+60% sales)
+   - trending subcategories: P x (purchase share last 2 h / usual share), shrunk to 1 with little data, clipped [0.67, 2]
 
 The same `features()` function builds the training rows and the live rows, so offline and live agree.
 """
@@ -29,27 +31,43 @@ from rawtree import Record, query_df, query_parts, to_epoch
 
 PAGES = {"home": 0, "product": 1, "category": 2}
 DEVICES = {"web": 0, "ios": 1, "android": 2}
+REGIONS = {r: i for i, r in enumerate([
+    "Andalucía", "Aragón", "Canarias", "Castilla y León", "Catalunya",
+    "Comunitat Valenciana", "Galicia", "Madrid", "Murcia", "País Vasco"])}
 POP_DAYS = 7          # popularity window
+TREND_HOURS = 2       # trend window (live)
 DAY = 86400.0
+NEVER = 999.0         # "days since" when it never happened
+NEW_PRODUCT_DAYS = 2  # a product created less than this ago counts as new
+NEW_PRODUCT_BOOST = 3.0
 
 FEATURES = [
     "pos",                # slot in the carousel (training only; 0 = first slot at inference)
     # session: what the shopper is doing right now
-    "in_views", "view_recency", "view_count", "n_views",
-    "same_subcat_views", "same_cat_views", "same_brand_views", "coview",
-    # user x item: what this shopper did with this product before
-    "ui_views", "ui_carts", "ui_buys", "ui_days_since",
-    # user x subcategory taste
-    "us_share", "us_count", "user_events",
-    # product
+    "in_views", "view_count", "n_views", "same_subcat_views", "same_cat_views", "same_brand_views", "coview",
+    # user x item, organic (shop.history_events + shop.events)
+    "ui_buys", "ui_carts", "ui_views", "days_since_buy", "days_since_cart",
+    # user x item, carousel (shop.history_sessions + our feedback)
+    "cs_clicks", "cs_buys",
+    # taste: shares of the user's activity / purchases (scale-free)
+    "us_share", "uc_share", "us_buy_share", "ub_buy_share", "has_history",
+    # product (scale-free: 1.0 = an average product)
     "pop_views", "pop_carts", "pop_buys", "cvr", "cart_rate", "log_price", "price_vs_subcat", "age_days",
     # context
-    "page", "device", "is_new_user",
+    "page", "device", "region", "is_new_user",
 ]
+CATEGORICAL = ["page", "device", "region"]
 
 
 def _until(until: str | None, col: str = "ts") -> str:
     return f" AND {col} < '{until}'" if until else ""
+
+
+def _index(users: np.ndarray) -> dict[str, tuple[int, int]]:
+    """Sorted user column -> {user: (start, end)} row slice."""
+    keys, starts = np.unique(users, return_index=True)
+    ends = np.append(starts[1:], len(users))
+    return {u: (s, e) for u, s, e in zip(keys, starts, ends)}
 
 
 class Store:
@@ -57,10 +75,13 @@ class Store:
 
     def __init__(self) -> None:
         self.until: str | None = None
-        self.unavailable: set[str] = set()          # out of stock / inactive right now
-        self.live_ui: dict[str, dict[str, list[float]]] = defaultdict(dict)   # user -> item -> [v, c, b, last]
-        self.live_us: dict[str, Counter] = defaultdict(Counter)                # user -> subcategory -> n
-        self.bought_from_us: dict[str, set[str]] = defaultdict(set)            # carousel purchases (feedback)
+        self.unavailable: set[str] = set()                                     # out of stock / inactive right now
+        self.live_ui: dict[str, dict[str, list[float]]] = defaultdict(dict)    # user -> item -> [v, c, b, last_cart, last_buy]
+        self.live_us: dict[str, Counter] = defaultdict(Counter)                 # user -> subcategory -> events
+        self.live_us_buy: dict[str, Counter] = defaultdict(Counter)             # user -> subcategory -> purchases
+        self.live_ub: dict[str, Counter] = defaultdict(Counter)                 # user -> brand -> purchases
+        self.live_cs: dict[str, dict[str, list[float]]] = {}                    # user -> item -> [clicks, buys] (our feedback)
+        self.trend_sc: dict[str, float] = {}                                    # subcategory -> trend multiplier (live)
         self.last_event_ts = ""
 
     # ------------------------------------------------------------------ loading
@@ -71,31 +92,40 @@ class Store:
         steps = [("catalog", lambda: s._load_catalog(live)),
                  ("user x item", lambda: s._load_user_items(until)),
                  ("user x subcategory", lambda: s._load_user_subcats(until)),
-                 ("popularity", lambda: s._load_popularity(until, live)),
+                 ("user x brand", lambda: s._load_user_brands(until)),
+                 ("carousel history", lambda: s._load_carousel(until)),
+                 ("popularity", lambda: s.load_popularity(until, live)),
                  ("co-views", lambda: s._load_coviews(until))]
         if live:
-            steps.append(("live events", s._load_live_events))
+            steps += [("live events", s._load_live_events), ("trends", s.load_trends)]
         for name, step in steps:
             t = time.time()
             step()
             if verbose:
-                print(f"  loaded {name} in {time.time() - t:.1f}s")
+                print(f"  loaded {name} in {time.time() - t:.1f}s", flush=True)
         return s
 
     def _load_catalog(self, live: bool) -> None:
+        base = query_df("""
+            SELECT product_id::String AS product_id, category::String AS category, subcategory::String AS subcategory,
+                   brand::String AS brand, price_eur::Float64 AS price_eur, is_active::Bool AS is_active,
+                   toString(created_at::DateTime64(3)) AS created_at
+            FROM shop.catalog""")
+        self.base_price = dict(zip(base.product_id, base.price_eur.astype(float)))   # price before any live change
+        cat, out = base, set()
         if live:
             cat = query_df("""
                 SELECT product_id, argMax(category, v) AS category, argMax(subcategory, v) AS subcategory,
                        argMax(brand, v) AS brand, argMax(price_eur, v) AS price_eur, argMax(is_active, v) AS is_active,
-                       argMax(created_at, v) AS created_at, argMax(change, v) AS last_change
+                       argMax(created_at, v) AS created_at
                 FROM (
                     SELECT product_id::String AS product_id, category::String AS category, subcategory::String AS subcategory,
                            brand::String AS brand, price_eur::Float64 AS price_eur, is_active::Bool AS is_active,
-                           toString(created_at::DateTime64(3)) AS created_at, '' AS change, '' AS v
+                           toString(created_at::DateTime64(3)) AS created_at, '' AS v
                     FROM shop.catalog
                     UNION ALL
                     SELECT product_id::String, category::String, subcategory::String, brand::String, price_eur::Float64,
-                           is_active::Bool, toString(created_at::DateTime64(3)), change::String, toString(ts::DateTime64(3))
+                           is_active::Bool, toString(created_at::DateTime64(3)), toString(ts::DateTime64(3))
                     FROM shop.catalog_updates
                 ) GROUP BY product_id""")
             stock = query_df("""
@@ -103,55 +133,74 @@ class Store:
                 WHERE change::String IN ('out_of_stock', 'back_in_stock') GROUP BY product_id
                 HAVING argMax(change::String, ts::DateTime64(3)) = 'out_of_stock'""")
             out = set(stock.product_id) if len(stock) else set()
-        else:
-            cat = query_df("""
-                SELECT product_id::String AS product_id, category::String AS category, subcategory::String AS subcategory,
-                       brand::String AS brand, price_eur::Float64 AS price_eur, is_active::Bool AS is_active,
-                       toString(created_at::DateTime64(3)) AS created_at
-                FROM shop.catalog""")
-            out = set()
         self.subcat = dict(zip(cat.product_id, cat.subcategory))
         self.category = dict(zip(cat.product_id, cat.category))
         self.brand = dict(zip(cat.product_id, cat.brand))
         self.price = dict(zip(cat.product_id, cat.price_eur.astype(float)))
         self.created = {p: to_epoch(c) for p, c in zip(cat.product_id, cat.created_at)}
+        for p, pr in self.price.items():
+            self.base_price.setdefault(p, pr)                                   # new products: first price is the base
         self.unavailable = set(cat.product_id[~cat.is_active.astype(bool)]) | out
-        med = cat.groupby("subcategory").price_eur.median()
-        self.subcat_price = med.to_dict()
+        self.cat_of_subcat = dict(zip(cat.subcategory, cat.category))
+        self.subcat_price = base.groupby("subcategory").price_eur.median().to_dict()
         self.products_by_subcat: dict[str, list[str]] = cat.groupby("subcategory").product_id.apply(list).to_dict()
 
     def _load_user_items(self, until: str | None) -> None:
-        """user x item table from organic history (views/carts/purchases). Single views are left out to save memory."""
+        """user x item from organic history. Only carts / purchases: views alone carry no signal (see analysis)."""
         df = query_parts(f"""
             SELECT user_id::String AS u, product_id::String AS p,
                    toUInt32(countIf(event_type = 'view')) AS v, toUInt32(countIf(event_type = 'add_to_cart')) AS c,
-                   toUInt32(countIf(event_type = 'purchase')) AS b, toUnixTimestamp(max(ts::DateTime64(3))) AS last
+                   toUInt32(countIf(event_type = 'purchase')) AS b,
+                   toUnixTimestamp(maxIf(ts::DateTime64(3), event_type = 'add_to_cart')) AS lc,
+                   toUnixTimestamp(maxIf(ts::DateTime64(3), event_type = 'purchase')) AS lb
             FROM shop.history_events WHERE {{part}}{_until(until)}
-            GROUP BY u, p HAVING b > 0 OR c > 0 OR v >= 2""", parts=4)
+            GROUP BY u, p HAVING b > 0 OR c > 0""", parts=4)
         df = df.sort_values("u", kind="stable").reset_index(drop=True)
-        users, starts = np.unique(df.u.to_numpy(), return_index=True)
-        ends = np.append(starts[1:], len(df))
-        self.ui_index = {u: (s, e) for u, s, e in zip(users, starts, ends)}
+        self.ui_index = _index(df.u.to_numpy())
         self.ui_p = df.p.to_numpy()
-        self.ui_vals = df[["v", "c", "b", "last"]].to_numpy(dtype=np.float64)
+        self.ui_vals = df[["v", "c", "b", "lc", "lb"]].to_numpy(dtype=np.float64)
 
     def _load_user_subcats(self, until: str | None) -> None:
         df = query_parts(f"""
-            SELECT e.user_id::String AS u, c.subcategory AS sc, toUInt32(count()) AS n
+            SELECT e.user_id::String AS u, c.subcategory AS sc, toUInt32(count()) AS n,
+                   toUInt32(countIf(e.event_type::String = 'purchase')) AS nb
             FROM shop.history_events AS e
             INNER JOIN (SELECT product_id::String AS p, subcategory::String AS subcategory FROM shop.catalog) AS c
                 ON c.p = e.product_id::String
             WHERE {{part}}{_until(until, 'e.ts')}
             GROUP BY u, sc""", parts=4, key="e.user_id::String")
         df = df.sort_values("u", kind="stable").reset_index(drop=True)
-        users, starts = np.unique(df.u.to_numpy(), return_index=True)
-        ends = np.append(starts[1:], len(df))
-        self.us_index = {u: (s, e) for u, s, e in zip(users, starts, ends)}
+        self.us_index = _index(df.u.to_numpy())
         self.us_sc = df.sc.to_numpy()
         self.us_n = df.n.to_numpy(dtype=np.float64)
+        self.us_nb = df.nb.to_numpy(dtype=np.float64)
 
-    def _load_popularity(self, until: str | None, live: bool = False) -> None:
-        """Views / carts / purchases per product over the last POP_DAYS days (history + live events)."""
+    def _load_user_brands(self, until: str | None) -> None:
+        df = query_df(f"""
+            SELECT e.user_id::String AS u, c.brand AS br, toUInt32(count()) AS nb
+            FROM shop.history_events AS e
+            INNER JOIN (SELECT product_id::String AS p, brand::String AS brand FROM shop.catalog) AS c
+                ON c.p = e.product_id::String
+            WHERE e.event_type::String = 'purchase'{_until(until, 'e.ts')}
+            GROUP BY u, br""")
+        df = df.sort_values("u", kind="stable").reset_index(drop=True)
+        self.ub_index = _index(df.u.to_numpy())
+        self.ub_br = df.br.to_numpy()
+        self.ub_nb = df.nb.to_numpy(dtype=np.float64)
+
+    def _load_carousel(self, until: str | None) -> None:
+        """Products each user clicked / bought in the old carousel (shop.history_sessions)."""
+        df = query_df(f"""
+            SELECT user_id::String AS u, clicked::String AS p, toUInt32(count()) AS c,
+                   toUInt32(countIf(purchased::String = clicked::String)) AS b
+            FROM shop.history_sessions WHERE clicked::String != ''{_until(until)}
+            GROUP BY u, p""")
+        self.cs: dict[str, dict[str, list[float]]] = defaultdict(dict)
+        for u, p, c, b in zip(df.u, df.p, df.c, df.b):
+            self.cs[u][p] = [float(c), float(b)]
+
+    def load_popularity(self, until: str | None = None, live: bool = False) -> None:
+        """Views / carts / purchases per product over the last POP_DAYS days, as shares (1.0 = average product)."""
         end = f"toDateTime64('{until}', 3)" if until else "now64(3)"
         source = "shop.history_events"
         if live:
@@ -163,11 +212,40 @@ class Store:
             FROM {source}
             WHERE ts::DateTime64(3) >= {end} - INTERVAL {POP_DAYS} DAY AND ts::DateTime64(3) < {end}
             GROUP BY p""")
-        self.pop = {p: (float(v), float(c), float(b)) for p, v, c, b in zip(df.p, df.v, df.c, df.b)}
+        self.pop_raw = {p: [float(v), float(c), float(b)] for p, v, c, b in zip(df.p, df.v, df.c, df.b)}
+        self.set_popularity(df)
+
+    def set_popularity(self, df) -> None:
+        """Counts per product (columns p, v, c, b) -> scale-free popularity features and best-seller lists."""
+        n = max(len(self.subcat), 1)
+        tv, tc, tb = (max(float(df[k].sum()), 1.0) / n for k in ("v", "c", "b"))
+        pop = {p: (v / tv, c / tc, b / tb, (b + 0.1) / (v + 20.0), (c + 0.1) / (v + 20.0))
+               for p, v, c, b in zip(df.p, df.v.astype(float), df.c.astype(float), df.b.astype(float))}
         ranked = df.sort_values(["b", "c", "v"], ascending=False)
-        self.top_global = ranked.p.tolist()
+        top_global = ranked.p.tolist()
         ranked = ranked.assign(sc=ranked.p.map(self.subcat))
-        self.top_by_subcat = ranked.groupby("sc", sort=False).p.apply(lambda s: s.head(20).tolist()).to_dict()
+        top_by_subcat = ranked.groupby("sc", sort=False).p.apply(lambda s: s.head(20).tolist()).to_dict()
+        self.pop, self.top_global, self.top_by_subcat = pop, top_global, top_by_subcat   # swap at once
+
+    def load_trends(self) -> None:
+        """Live: purchase share of each subcategory in the last TREND_HOURS vs its share in the last week of history."""
+        df = query_df(f"""
+            SELECT c.subcategory AS sc,
+                   countIf(e.src = 'live') AS a, countIf(e.src = 'ref') AS r
+            FROM (SELECT product_id::String AS p, 'live' AS src FROM shop.events
+                  WHERE event_type::String = 'purchase' AND ts::DateTime64(3) > now64(3) - INTERVAL {TREND_HOURS} HOUR
+                  UNION ALL
+                  SELECT product_id::String AS p, 'ref' AS src FROM shop.history_events
+                  WHERE event_type::String = 'purchase'
+                    AND ts::DateTime64(3) > (SELECT max(ts::DateTime64(3)) FROM shop.history_events) - INTERVAL 7 DAY) AS e
+            INNER JOIN (SELECT product_id::String AS p, subcategory::String AS subcategory FROM shop.catalog) AS c ON c.p = e.p
+            GROUP BY sc""")
+        A, R = float(df.a.sum()), max(float(df.r.sum()), 1.0)
+        trend = {}
+        for sc, a, r in zip(df.sc, df.a.astype(float), df.r.astype(float)):
+            expected = A * r / R                                     # purchases if the subcategory kept its usual share
+            trend[sc] = float(np.clip((a + 20.0) / (expected + 20.0), 0.67, 2.0))
+        self.trend_sc = trend
 
     def _load_coviews(self, until: str | None) -> None:
         """For every product, the 20 products most viewed in the same sessions."""
@@ -186,24 +264,35 @@ class Store:
         df = query_parts("""
             SELECT user_id::String AS u, product_id::String AS p, event_type::String AS e,
                    toUInt32(count()) AS n, toUnixTimestamp(max(ts::DateTime64(3))) AS last
-            FROM shop.events WHERE {part} GROUP BY u, p, e""", parts=2)
+            FROM shop.events WHERE {part} GROUP BY u, p, e""", parts=4)
         self.ingest(df.itertuples(index=False))
         last = query_df("SELECT toString(max(ts::DateTime64(3))) AS t FROM shop.events")
         self.last_event_ts = last.t[0] if len(last) else ""
 
     # ------------------------------------------------------------------ live updates
     def ingest(self, events: Iterable) -> None:
-        """Add organic events (u, p, e, n, last) to the live user x item / user x subcategory tables."""
-        col = {"view": 0, "add_to_cart": 1, "purchase": 2}
+        """Add organic events (user, product, event_type, count, last_ts) to the live tables."""
         for u, p, e, n, last in events:
-            if e not in col:
-                continue
-            row = self.live_ui[u].setdefault(p, [0.0, 0.0, 0.0, 0.0])
-            row[col[e]] += float(n)
-            row[3] = max(row[3], float(last))
+            n, last = float(n), float(last)
             sc = self.subcat.get(p)
             if sc:
-                self.live_us[u][sc] += float(n)
+                self.live_us[u][sc] += n
+            if e == "view":
+                if p in self.live_ui.get(u, {}):
+                    self.live_ui[u][p][0] += n
+                continue
+            row = self.live_ui[u].setdefault(p, [0.0, 0.0, 0.0, 0.0, 0.0])
+            if e == "add_to_cart":
+                row[1] += n
+                row[3] = max(row[3], last)
+            elif e == "purchase":
+                row[2] += n
+                row[4] = max(row[4], last)
+                if sc:
+                    self.live_us_buy[u][sc] += n
+                br = self.brand.get(p)
+                if br:
+                    self.live_ub[u][br] += n
 
     def apply_catalog_update(self, u: Record) -> None:
         """One shop.catalog_updates record: new product, price change, stock-out or back in stock."""
@@ -214,6 +303,7 @@ class Store:
         self.brand[p] = u.get("brand") or self.brand.get(p)
         if u.get("price_eur") is not None:
             self.price[p] = float(u["price_eur"])
+            self.base_price.setdefault(p, float(u["price_eur"]))
         if change == "new_product":
             self.created[p] = to_epoch(u["created_at"]) if u.get("created_at") else time.time()
             items = self.products_by_subcat.setdefault(self.subcat[p], [])
@@ -226,22 +316,43 @@ class Store:
 
     # ------------------------------------------------------------------ lookups
     def user_items(self, user: str) -> dict[str, np.ndarray]:
-        """item -> [views, carts, buys, last_ts] for one user (history + live)."""
+        """item -> [views, carts, buys, last_cart_ts, last_buy_ts] for one user (history + live)."""
         s, e = self.ui_index.get(user, (0, 0))
         out = {p: self.ui_vals[i].copy() for i, p in zip(range(s, e), self.ui_p[s:e])}
         for p, row in self.live_ui.get(user, {}).items():
             if p in out:
                 out[p][:3] += row[:3]
-                out[p][3] = max(out[p][3], row[3])
+                out[p][3:] = np.maximum(out[p][3:], row[3:])
             else:
                 out[p] = np.array(row, dtype=np.float64)
         return out
 
-    def user_subcats(self, user: str) -> Counter:
+    def user_subcats(self, user: str) -> tuple[Counter, Counter]:
+        """(events per subcategory, purchases per subcategory) for one user."""
         s, e = self.us_index.get(user, (0, 0))
-        c = Counter(dict(zip(self.us_sc[s:e], self.us_n[s:e])))
-        c.update(self.live_us.get(user, {}))
+        n = Counter(dict(zip(self.us_sc[s:e], self.us_n[s:e])))
+        nb = Counter({k: v for k, v in zip(self.us_sc[s:e], self.us_nb[s:e]) if v})
+        n.update(self.live_us.get(user, {}))
+        nb.update(self.live_us_buy.get(user, {}))
+        return n, nb
+
+    def user_brands(self, user: str) -> Counter:
+        s, e = self.ub_index.get(user, (0, 0))
+        c = Counter(dict(zip(self.ub_br[s:e], self.ub_nb[s:e])))
+        c.update(self.live_ub.get(user, {}))
         return c
+
+    def carousel(self, user: str) -> dict[str, list[float]]:
+        """item -> [clicks, buys] in the carousel (history + our feedback)."""
+        hist, live = self.cs.get(user, {}), self.live_cs.get(user, {})
+        if not live:
+            return hist
+        out = {p: list(v) for p, v in hist.items()}
+        for p, (c, b) in live.items():
+            row = out.setdefault(p, [0.0, 0.0])
+            row[0] += c
+            row[1] += b
+        return out
 
 
 class Ranker:
@@ -253,30 +364,35 @@ class Ranker:
     @classmethod
     def load(cls, path: str | Path) -> "Ranker":
         import lightgbm as lgb
-        return cls(lgb.Booster(model_file=str(path)))
+        booster = lgb.Booster(model_file=str(path))
+        if booster.feature_name() != FEATURES:   # an old model with other features would silently mis-score
+            raise ValueError(f"{path} was trained with other features; retrain it with starter/train.py")
+        return cls(booster)
 
     def score(self, X: np.ndarray) -> np.ndarray:
+        """A positive score (probability-like), so that live adjustments can multiply it."""
         if self.booster is not None:
             return self.booster.predict(X)
-        return heuristic_score(X)
+        return np.exp(heuristic_score(X))
 
 
 def heuristic_score(X: np.ndarray) -> np.ndarray:
-    """Hand-made score (log-odds style) used before a model is trained. Weights from the exploration:
-    a just-viewed item sells ~15x more, an item the user bought before ~30x, same subcategory ~2x."""
+    """Hand-made log-score used before a model is trained, from the multipliers measured in the data analysis."""
     f = {name: X[:, i] for i, name in enumerate(FEATURES)}
-    return (2.7 * f["in_views"] + 0.5 * f["view_recency"] + 0.4 * f["view_count"]
-            + 1.2 * np.log1p(f["ui_buys"]) + 0.6 * np.log1p(f["ui_carts"]) + 0.3 * np.log1p(f["ui_views"])
-            + 0.6 * np.minimum(f["same_subcat_views"], 2) + 0.15 * f["same_cat_views"] + 0.2 * f["same_brand_views"]
-            + 1.5 * f["us_share"] + 0.3 * f["coview"]
-            + 0.25 * np.log1p(f["pop_buys"]) + 8 * f["cvr"])
+    recent_buy = np.where(f["days_since_buy"] < 1, 1.0, np.where(f["days_since_buy"] < 7, 0.8, 0.5))
+    return (3.0 * f["in_views"] + 3.0 * np.minimum(f["ui_buys"], 1) * recent_buy + 1.5 * np.minimum(f["ui_carts"], 1)
+            + 2.5 * np.minimum(f["cs_buys"], 1) + 1.0 * np.minimum(f["cs_clicks"], 1)
+            + 4.0 * f["uc_share"] + 2.0 * f["us_share"] + 1.0 * f["ub_buy_share"] + 0.6 * np.minimum(f["same_subcat_views"], 2)
+            + 0.2 * f["coview"] + 0.3 * np.log1p(f["pop_buys"]) + 8 * f["cvr"])
 
 
 class Recommender:
-    def __init__(self, store: Store, ranker: Ranker | None = None, n_candidates: int = 200) -> None:
+    def __init__(self, store: Store, ranker: Ranker | None = None, n_candidates: int = 200,
+                 adjust: bool = True) -> None:
         self.store = store
         self.ranker = ranker or Ranker()
         self.n_candidates = n_candidates
+        self.adjust = adjust                     # live adjustments for price drops and trends
 
     # ------------------------------------------------------------------ public
     def recommend(self, req: Record, k: int = 10) -> list[str]:
@@ -286,14 +402,25 @@ class Recommender:
             cands = self.candidates(ctx)
             if cands:
                 scores = self.ranker.score(self.features(ctx, cands))
+                if self.adjust:
+                    scores = scores * self.adjustments(cands, ctx["now"])
                 order = np.argsort(-scores, kind="stable")
                 ranked = [cands[i] for i in order]
             else:
                 ranked = []
+            exclude = self.already_bought(ctx)
         except Exception as e:  # never let one bad request break the batch
             print(f"recommend failed for {req.get('request_id')}: {e!r}")
-            ranked = []
-        return self.fill(ranked, k, exclude=self.store.bought_from_us.get(req.get("user_id", ""), set()))
+            ranked, exclude = [], set()
+        return self.fill(ranked, k, exclude)
+
+    @staticmethod
+    def already_bought(ctx: dict[str, Any]) -> set[str]:
+        """Products this shopper already bought (organic or in the carousel). Live they are almost never bought
+        again (0.06 per 1,000 impressions vs 0.8 for an unrelated product), so they waste a slot."""
+        out = {p for p, row in ctx["ui"].items() if row[2] > 0}
+        out.update(p for p, (_, b) in ctx["cs"].items() if b > 0)
+        return out
 
     def fill(self, ranked: list[str], k: int = 10, exclude: set[str] = frozenset()) -> list[str]:
         """Keep valid items, then pad with best sellers so the answer always has k distinct products."""
@@ -301,11 +428,24 @@ class Recommender:
         out: list[str] = []
         seen: set[str] = set()
         for p in list(ranked) + s.top_global:
-            if p not in seen and p not in s.unavailable and p not in exclude and p in s.subcat:
+            if p not in seen and p not in exclude and p not in s.unavailable and p in s.subcat:
                 out.append(p)
                 seen.add(p)
                 if len(out) == k:
                     break
+        return out
+
+    def adjustments(self, cands: list[str], now: float) -> np.ndarray:
+        """Multipliers for what the history cannot teach (1.0 offline):
+        - products added during the event sell ~6x more per impression live -> x NEW_PRODUCT_BOOST
+        - trending subcategories (purchase share last 2 h vs usual)
+        Price drops are NOT boosted: live, discounted products did not sell more in the carousel."""
+        s = self.store
+        out = np.ones(len(cands))
+        for i, p in enumerate(cands):
+            if now - s.created.get(p, 0.0) < NEW_PRODUCT_DAYS * DAY:
+                out[i] *= NEW_PRODUCT_BOOST
+            out[i] *= s.trend_sc.get(s.subcat.get(p), 1.0)
         return out
 
     # ------------------------------------------------------------------ steps
@@ -316,24 +456,27 @@ class Recommender:
         user = req.get("user_id") or ""
         ts = req.get("ts")
         now = to_epoch(ts) if isinstance(ts, str) else time.time()
-        recency: dict[str, int] = {}
-        for k, p in enumerate(reversed(views)):        # 0 = most recent view
-            recency.setdefault(p, k)
         cov: Counter = Counter()
         for k, p in enumerate(reversed(views[-5:])):
             for rank, q in enumerate(s.coviews.get(p, [])):
                 cov[q] += 0.7 ** k / (rank + 1)
-        us = s.user_subcats(user)
+        us, us_buy = s.user_subcats(user)
+        uc: Counter = Counter()
+        for sc, n in us.items():
+            uc[s.cat_of_subcat.get(sc)] += n
+        ub = s.user_brands(user)
         is_new = req.get("is_new_user")
         if is_new is None:            # history rows don't carry the flag: new = no organic history at all
             is_new = user not in s.us_index
         return {
-            "user": user, "now": now, "views": views, "recency": recency, "view_count": Counter(views),
+            "user": user, "now": now, "views": views, "view_count": Counter(views),
             "v_subcats": Counter(s.subcat.get(p) for p in views), "v_cats": Counter(s.category.get(p) for p in views),
             "v_brands": Counter(s.brand.get(p) for p in views), "coview": cov,
-            "ui": s.user_items(user), "us": us, "us_total": float(sum(us.values())),
+            "ui": s.user_items(user), "cs": s.carousel(user),
+            "us": us, "us_total": float(sum(us.values())), "us_buy": us_buy, "us_buy_total": float(sum(us_buy.values())),
+            "uc": uc, "ub": ub, "ub_total": float(sum(ub.values())),
             "page": PAGES.get(req.get("page") or "", -1), "device": DEVICES.get(req.get("device") or "", -1),
-            "is_new_user": float(bool(is_new)),
+            "region": REGIONS.get(req.get("region") or "", -1), "is_new_user": float(bool(is_new)),
         }
 
     def candidates(self, ctx: dict[str, Any]) -> list[str]:
@@ -349,17 +492,36 @@ class Recommender:
                     out.setdefault(p)
                     n += 1
 
+        ui, cs = ctx["ui"], ctx["cs"]
         add(reversed(ctx["views"]), 20)                                                   # just viewed
-        ui = ctx["ui"]
-        add(sorted(ui, key=lambda p: -(5 * ui[p][2] + 2 * ui[p][1] + ui[p][0] + ui[p][3] / 1e9))[:60], 40)  # user history
+        carted = [p for p in ui if ui[p][1] > 0 and ui[p][2] == 0]                       # in the cart, not bought
+        add(sorted(carted, key=lambda p: -ui[p][3])[:40], 30)
+        add(sorted((p for p in cs if cs[p][1] == 0), key=lambda p: -cs[p][0])[:20], 15)  # clicked in the carousel
+        new = self._new_products(ctx["now"])                                              # cold start: new products
+        if new:
+            cats = [c for c, _ in (ctx["v_cats"] + Counter()).most_common(2)] + [c for c, _ in ctx["uc"].most_common(2)]
+            for c in dict.fromkeys(cats):
+                add((p for p in new if s.category.get(p) == c), 4)
+            add(sorted(new, key=lambda p: -s.pop.get(p, (0, 0, 0))[2])[:10], 6)
         add((q for q, _ in ctx["coview"].most_common(40)), 40)                           # co-viewed
         for sc, _ in (ctx["v_subcats"] + Counter()).most_common(3):                       # browsing subcategories
             add(s.top_by_subcat.get(sc, []), 10)
             add(self._newest(sc), 3)                                                      # cold start: new products
         for sc, _ in ctx["us"].most_common(3):                                            # long-term taste
             add(s.top_by_subcat.get(sc, []), 6)
+            add(self._newest(sc), 2)
         add(s.top_global, 30)                                                             # best sellers
         return list(out)[: self.n_candidates]
+
+    def _new_products(self, now: float) -> list[str]:
+        """Products created less than NEW_PRODUCT_DAYS ago, newest first (cached for a minute)."""
+        s = self.store
+        if now - getattr(self, "_new_at", -1e18) > 60 or abs(now - self._new_at) > 3600:
+            cutoff = now - NEW_PRODUCT_DAYS * DAY
+            self._new_cache = sorted((p for p, t in s.created.items() if cutoff <= t <= now),
+                                     key=lambda p: -s.created[p])
+            self._new_at = now
+        return self._new_cache
 
     def _newest(self, subcat: str) -> list[str]:
         s = self.store
@@ -370,36 +532,41 @@ class Recommender:
         s = self.store
         X = np.zeros((len(cands), len(FEATURES)), dtype=np.float64)
         n_views = len(ctx["views"])
+        now = ctx["now"]
+        us_total, us_buy_total, ub_total = ctx["us_total"], ctx["us_buy_total"], ctx["ub_total"]
+        has_history = 1.0 if us_total > 0 else 0.0
         for i, p in enumerate(cands):
             sc, cat, br = s.subcat.get(p), s.category.get(p), s.brand.get(p)
             ui = ctx["ui"].get(p)
-            pv, pc, pb = s.pop.get(p, (0.0, 0.0, 0.0))
+            cs = ctx["cs"].get(p)
+            pv, pc, pb, cvr, cart_rate = s.pop.get(p, (0.0, 0.0, 0.0, 0.005, 0.005))
             price = s.price.get(p, 0.0)
-            rec = ctx["recency"].get(p)
             X[i] = (
                 positions[i] if positions else 0,
-                1.0 if rec is not None else 0.0,
-                1.0 / (1 + rec) if rec is not None else 0.0,
+                1.0 if p in ctx["view_count"] else 0.0,
                 ctx["view_count"].get(p, 0),
                 n_views,
                 ctx["v_subcats"].get(sc, 0),
                 ctx["v_cats"].get(cat, 0),
                 ctx["v_brands"].get(br, 0),
                 ctx["coview"].get(p, 0.0),
-                ui[0] if ui is not None else 0.0,
-                ui[1] if ui is not None else 0.0,
                 ui[2] if ui is not None else 0.0,
-                min((ctx["now"] - ui[3]) / DAY, 90.0) if ui is not None and ui[3] > 0 else 90.0,
-                ctx["us"].get(sc, 0.0) / ctx["us_total"] if ctx["us_total"] else 0.0,
-                ctx["us"].get(sc, 0.0),
-                ctx["us_total"],
-                math.log1p(pv), math.log1p(pc), math.log1p(pb),
-                (pb + 0.1) / (pv + 20.0),
-                (pc + 0.1) / (pv + 20.0),
+                ui[1] if ui is not None else 0.0,
+                ui[0] if ui is not None else 0.0,
+                min((now - ui[4]) / DAY, NEVER) if ui is not None and ui[4] > 0 else NEVER,
+                min((now - ui[3]) / DAY, NEVER) if ui is not None and ui[3] > 0 else NEVER,
+                cs[0] if cs is not None else 0.0,
+                cs[1] if cs is not None else 0.0,
+                ctx["us"].get(sc, 0.0) / us_total if us_total else 0.0,
+                ctx["uc"].get(cat, 0.0) / us_total if us_total else 0.0,
+                ctx["us_buy"].get(sc, 0.0) / us_buy_total if us_buy_total else 0.0,
+                ctx["ub"].get(br, 0.0) / ub_total if ub_total else 0.0,
+                has_history,
+                pv, pc, pb, cvr, cart_rate,
                 math.log1p(price),
                 price / s.subcat_price.get(sc, price or 1.0) if price else 1.0,
-                min((ctx["now"] - s.created.get(p, 0.0)) / DAY, 999.0),
-                ctx["page"], ctx["device"], ctx["is_new_user"],
+                min((now - s.created.get(p, 0.0)) / DAY, 999.0),
+                ctx["page"], ctx["device"], ctx["region"], ctx["is_new_user"],
             )
         return X
 
