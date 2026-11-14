@@ -1,6 +1,7 @@
 """Live recommender: the personalised model answering shop.requests in real time.
 
-    python starter/live.py --version v7-name     # production (supervised: restarted by itself if it dies or hangs)
+    python starter/live.py --version v8-name     # production: ranker_v8 + price tilt 0.2 (supervised: restarted
+                                                 # by itself if it dies or hangs)
     python starter/live.py --shadow              # dry run: compute answers and measure, write NOTHING
 
 Reliability (10 points, and every late answer is served the fallback):
@@ -117,19 +118,24 @@ def _ts(ts: str) -> float:
 
 
 class Live:
-    def __init__(self, model_path: Path, arms: list[tuple[str, float]], shadow: bool) -> None:
-        self.version = " / ".join(a for a, _ in arms)
-        self.shadow, self.model_path = shadow, model_path
+    def __init__(self, model_path: Path, arms: list[tuple[str, float, Path | None]], shadow: bool) -> None:
+        self.version = " / ".join(a[0] for a in arms)
+        self.shadow = shadow
         log("loading store (history + today's events), ~2.5 min ...")
         self.store = Store.load(live=True)
-        ranker = Ranker.load(model_path) if model_path.exists() else Ranker()
-        # A/B: every arm shares the store and the model; each request goes to one arm by a hash of its id
-        self.arms = [(name, Recommender(self.store, ranker, price_tilt=tilt)) for name, tilt in arms]
+        # A/B: the arms share the store; each has its own price tilt and (optionally) its own model file.
+        # Every request goes to one arm by a hash of its id.
+        self.models: dict[Path, list] = {}       # model file -> [ranker, mtime]
+        self.arms: list[tuple[str, Recommender, Path]] = []
+        for name, tilt, path in arms:
+            path = path or model_path
+            if path not in self.models:
+                self.models[path] = [Ranker.load(path) if path.exists() else Ranker(),
+                                     path.stat().st_mtime if path.exists() else 0.0]
+            self.arms.append((name, Recommender(self.store, self.models[path][0], price_tilt=tilt), path))
         self.rec = self.arms[0][1]
-        if len(arms) > 1 or arms[0][1]:
-            log("arms: " + ", ".join(f"{n} (price tilt {t:g})" for n, t in arms))
-        self.model_mtime = model_path.stat().st_mtime if model_path.exists() else 0.0
-        log(f"ranker: {model_path.name if model_path.exists() else 'hand-made score (no model file found)'}")
+        log("arms: " + ", ".join(f"{n} (price tilt {r.price_tilt:g}, model "
+                                 f"{p.name if p.exists() else 'hand-made score: no model file'})" for n, r, p in self.arms))
         self.lock = threading.Lock()              # the refresher mutates the store, the main loop reads it
         self.stats_lock = threading.Lock()
         self.seen: dict[str, float] = {}          # request_id -> when we answered it
@@ -192,7 +198,7 @@ class Live:
         with self.lock:
             for r in reqs:
                 t = time.perf_counter()
-                version, rec = self.arms[zlib.crc32(r["request_id"].encode()) % len(self.arms)]
+                version, rec, _ = self.arms[zlib.crc32(r["request_id"].encode()) % len(self.arms)]
                 items = rec.recommend(r)
                 self.stats["compute_ms"].append(1000 * (time.perf_counter() - t))
                 if len(items) != 10 or len(set(items)) != 10 or any(p in self.store.unavailable for p in items):
@@ -284,14 +290,16 @@ class Live:
         self.store.load_popularity(None, live=True)
 
     def reload_model(self) -> None:
-        """Hot reload: when the model file changes, swap it in without restarting. A broken file is ignored."""
-        if not self.model_path.exists() or self.model_path.stat().st_mtime == self.model_mtime:
-            return
-        self.model_mtime = self.model_path.stat().st_mtime
-        ranker = Ranker.load(self.model_path)
-        for _, rec in self.arms:
-            rec.ranker = ranker
-        log(f"reloaded model {self.model_path.name}")
+        """Hot reload: when a model file changes, swap it in without restarting. A broken file is ignored."""
+        for path, entry in self.models.items():
+            if not path.exists() or path.stat().st_mtime == entry[1]:
+                continue
+            entry[1] = path.stat().st_mtime
+            entry[0] = Ranker.load(path)
+            for _, rec, p in self.arms:
+                if p == path:
+                    rec.ranker = entry[0]
+            log(f"reloaded model {path.name}")
 
     # ------------------------------------------------------------------ report
     def report(self) -> None:
@@ -339,19 +347,34 @@ def supervise(argv: list[str], version: str) -> None:
         time.sleep(3)
 
 
+def _arm(spec: str) -> tuple[str, float, Path | None]:
+    """'v9a=0.2' or 'v9b=0.2@ranker_v9' -> (name, price tilt, model file or None = the default --model)."""
+    name, _, rest = spec.partition("=")
+    tilt, _, model = rest.partition("@")
+    model = model.strip()
+    path = None
+    if model:
+        path = Path(model) if Path(model).is_absolute() else ROOT / "models" / (model if model.endswith(".txt") else model + ".txt")
+    return name.strip(), float(tilt or 0), path
+
+
 def main() -> None:
     global _log_file
     ap = argparse.ArgumentParser()
     ap.add_argument("--shadow", action="store_true", help="do not write submissions, only measure")
-    ap.add_argument("--version", default="v7", help="model_version written with each answer")
-    ap.add_argument("--price-tilt", type=float, default=0.0, help="rank by P(buy) x price^tilt (0 = conversion)")
-    ap.add_argument("--ab", default="", help='A/B arms "name=tilt,name=tilt": traffic split evenly by request id')
-    ap.add_argument("--model", default=str(ROOT / "models" / "ranker_v7.txt"))
+    ap.add_argument("--version", default="v8", help="model_version written with each answer")
+    ap.add_argument("--price-tilt", type=float, default=0.2,
+                    help="rank by P(buy) x price^tilt (0 = pure conversion; 0.2 = v8, won its A/B)")
+    ap.add_argument("--ab", default="", help='A/B arms "name=tilt,name=tilt@model_file": traffic split evenly by '
+                                             'request id; each arm can use its own file in models/')
+    ap.add_argument("--model", default=str(ROOT / "models" / "ranker_v8.txt"))
     ap.add_argument("--child", action="store_true", help=argparse.SUPPRESS)   # started by the supervisor
     args = ap.parse_args()
-    arms = ([(a.split("=")[0].strip(), float(a.split("=")[1])) for a in args.ab.split(",")] if args.ab
-            else [(args.version, args.price_tilt)])
-    name = "+".join(n for n, _ in arms)
+    arms = [_arm(a) for a in args.ab.split(",")] if args.ab else [(args.version, args.price_tilt, None)]
+    missing = [str(p) for _, _, p in arms if p is not None and not p.exists()]
+    if missing:
+        sys.exit(f"model file not found: {', '.join(missing)}")
+    name = "+".join(a[0] for a in arms)
     LOGS.mkdir(exist_ok=True)
     _log_file = LOGS / f"live_{'shadow' if args.shadow else name}.log"
     quiet_console()

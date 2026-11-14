@@ -334,7 +334,7 @@ class Store:
         if change == "new_product" and p not in self.by_subcat.get(self.subcat.get(p), []):
             self.by_subcat[self.subcat.get(p)].append(p)
         if u.get("price_eur") is not None:
-            self.price[p] = float(u["price_eur"])
+            self.__dict__.setdefault("price", {})[p] = float(u["price_eur"])   # (stores cached before prices existed)
         if change == "new_product":
             self.created[p] = to_epoch(u["created_at"]) if u.get("created_at") else time.time()
         if change == "out_of_stock" or u.get("is_active") is False:
