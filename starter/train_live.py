@@ -33,8 +33,8 @@ from rawtree import ROOT, TEAM, query_df, to_epoch  # noqa: E402
 from train import auc, cached  # noqa: E402
 
 MODELS = ROOT / "models"
-NEW_FEATURES = ["is_new_product", "discount", "trend", "times_shown"]   # added in v4
-OLD = [i for i, f in enumerate(FEATURES) if f not in NEW_FEATURES]    # the v3 feature set
+ATTR_FEATURES = ["attr_lift_mean", "attr_lift_min", "attr_lift_max", "attr_views_match"]   # added in v5
+NO_ATTR = [i for i, f in enumerate(FEATURES) if f not in ATTR_FEATURES]    # the v4 feature set
 
 
 def fetch_live() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
@@ -171,9 +171,9 @@ def variants(X, yb, yc):
     """Every candidate way of scoring: name -> (train function, predict function)."""
     mix_w = lambda y: np.where(y == 1, 3.0, 1.0)  # noqa: E731
 
-    def mix_old(Xt, b, c):
-        m = fit(Xt, np.maximum(c, b), mix_w(b), cols=OLD)
-        return [m], lambda Z: m.predict(Z[:, OLD])
+    def v4(Xt, b, c):
+        m = fit(Xt, b, cols=NO_ATTR)
+        return [m], lambda Z: m.predict(Z[:, NO_ATTR])
 
     def mix_new(Xt, b, c):
         m = fit(Xt, np.maximum(c, b), mix_w(b))
@@ -189,18 +189,18 @@ def variants(X, yb, yc):
         mb = fit(Xt[clicked], b[clicked], params=PARAMS_SMALL)
         return [mc, mb], lambda Z: mc.predict(Z) * mb.predict(Z)
 
-    return {"v3-swallow (click+3x buy, v3 features)": mix_old, "click+3x buy, v4 features": mix_new,
-            "purchase only, v4 features": purchase, "two-stage P(click) x P(buy|click), v4": two_stage}
+    return {"v4-raven (purchase, no attributes)": v4, "v5: purchase + attributes": purchase,
+            "v5: click+3x buy + attributes": mix_new, "v5: two-stage + attributes": two_stage}
 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--final", action="store_true", help="train the best variant on all live rows and save it")
-    ap.add_argument("--out", default="ranker_v4", help="model file name (without .txt)")
+    ap.add_argument("--out", default="ranker_v5", help="model file name (without .txt)")
     args = ap.parse_args()
 
     print("history store (everything before the event) ...")
-    store = cached("store_v2_all", lambda: Store.load(until=None))
+    store = cached("store_v3_all", lambda: Store.load(until=None))
     store.live_cs, store.shown = {}, defaultdict(Counter)
     print("live data ...")
     events, updates, fb = cached(f"live_{time.strftime('%Y%m%d%H')}", fetch_live)
@@ -239,7 +239,7 @@ def main() -> None:
 def save_final(best: str, X, yb, yc, models, out: str) -> None:
     """Retrain the chosen variant on ALL live rows (same number of trees) and write it atomically."""
     main_path, buy_path = MODELS / f"{out}.txt", MODELS / f"{out}_buy.txt"
-    if best.startswith("two-stage"):
+    if "two-stage" in best:
         mc = fit(X, yc, rounds=max(models[0].best_iteration, 50))
         clicked = yc == 1
         mb = fit(X[clicked], yb[clicked], params=PARAMS_SMALL, rounds=max(models[1].best_iteration, 30))
@@ -247,8 +247,6 @@ def save_final(best: str, X, yb, yc, models, out: str) -> None:
         os.replace(buy_path.with_suffix(".tmp"), buy_path)
         final = mc
     else:
-        if best.startswith("v3"):
-            print("the v3 feature set won: keeping v4 features anyway (same file format), retrain with them")
         y = np.maximum(yc, yb) if "click+3x" in best else yb
         w = np.where(yb == 1, 3.0, 1.0) if "click+3x" in best else None
         final = fit(X, y, w, rounds=max(models[0].best_iteration, 50))

@@ -39,6 +39,22 @@ TREND_HOURS = 2       # trend window (live)
 DAY = 86400.0
 NEVER = 999.0         # "days since" when it never happened
 NEW_PRODUCT_DAYS = 2  # a product created less than this ago counts as new
+# Every product description carries exactly 2 of these attributes. Live, a shopper buys ~20x more when the product's
+# attributes are the ones they usually interact with -- even outside their favourite categories.
+ATTRIBUTES = [
+    "a sporty style", "a family-size format", "organic ingredients", "a luxury feel", "a minimalist design",
+    "built for professionals", "premium materials", "designed for kids", "bold colours", "wireless connectivity",
+    "whisper-quiet operation", "a vintage look", "smart app control", "made from recycled materials",
+    "great value for money", "a travel-ready build", "a waterproof shell", "extra durability", "a handmade finish",
+    "compact and lightweight"]
+ATTR_INDEX = {a: i for i, a in enumerate(ATTRIBUTES)}
+ATTR_SQL = "[" + ",".join(f"'{a}'" for a in ATTRIBUTES) + "]"
+
+
+def parse_attrs(description: str) -> tuple[int, ...]:
+    """The attribute indices mentioned in a product description."""
+    d = description or ""
+    return tuple(i for i, a in enumerate(ATTRIBUTES) if a in d)
 NEW_PRODUCT_BOOST = 3.0
 
 FEATURES = [
@@ -55,6 +71,8 @@ FEATURES = [
     "pop_views", "pop_carts", "pop_buys", "cvr", "cart_rate", "log_price", "price_vs_subcat", "age_days",
     # live dynamics (learnt from the live replay; constant in the history)
     "is_new_product", "discount", "trend", "times_shown",
+    # attribute taste (hidden driver of the simulator): user's affinity with the product's 2 attributes
+    "attr_lift_mean", "attr_lift_min", "attr_lift_max", "attr_views_match",
     # context
     "page", "device", "region", "is_new_user",
 ]
@@ -85,6 +103,7 @@ class Store:
         self.live_cs: dict[str, dict[str, list[float]]] = {}                    # user -> item -> [clicks, buys] (our feedback)
         self.trend_sc: dict[str, float] = {}                                    # subcategory -> trend (live, 1 = usual)
         self.shown: dict[str, Counter] = defaultdict(Counter)                   # user -> item -> times we showed it
+        self.live_ua: dict[str, np.ndarray] = {}                                # user -> events per attribute (live)
         self.last_event_ts = ""
 
     # ------------------------------------------------------------------ loading
@@ -96,6 +115,7 @@ class Store:
                  ("user x item", lambda: s._load_user_items(until)),
                  ("user x subcategory", lambda: s._load_user_subcats(until)),
                  ("user x brand", lambda: s._load_user_brands(until)),
+                 ("user x attribute", lambda: s._load_user_attrs(until)),
                  ("carousel history", lambda: s._load_carousel(until)),
                  ("popularity", lambda: s.load_popularity(until, live)),
                  ("co-views", lambda: s._load_coviews(until))]
@@ -112,7 +132,7 @@ class Store:
         base = query_df("""
             SELECT product_id::String AS product_id, category::String AS category, subcategory::String AS subcategory,
                    brand::String AS brand, price_eur::Float64 AS price_eur, is_active::Bool AS is_active,
-                   toString(created_at::DateTime64(3)) AS created_at
+                   toString(created_at::DateTime64(3)) AS created_at, description::String AS description
             FROM shop.catalog""")
         self.base_price = dict(zip(base.product_id, base.price_eur.astype(float)))   # price before any live change
         cat, out = base, set()
@@ -120,15 +140,15 @@ class Store:
             cat = query_df("""
                 SELECT product_id, argMax(category, v) AS category, argMax(subcategory, v) AS subcategory,
                        argMax(brand, v) AS brand, argMax(price_eur, v) AS price_eur, argMax(is_active, v) AS is_active,
-                       argMax(created_at, v) AS created_at
+                       argMax(created_at, v) AS created_at, argMax(description, v) AS description
                 FROM (
                     SELECT product_id::String AS product_id, category::String AS category, subcategory::String AS subcategory,
                            brand::String AS brand, price_eur::Float64 AS price_eur, is_active::Bool AS is_active,
-                           toString(created_at::DateTime64(3)) AS created_at, '' AS v
+                           toString(created_at::DateTime64(3)) AS created_at, description::String AS description, '' AS v
                     FROM shop.catalog
                     UNION ALL
                     SELECT product_id::String, category::String, subcategory::String, brand::String, price_eur::Float64,
-                           is_active::Bool, toString(created_at::DateTime64(3)), toString(ts::DateTime64(3))
+                           is_active::Bool, toString(created_at::DateTime64(3)), description::String, toString(ts::DateTime64(3))
                     FROM shop.catalog_updates
                 ) GROUP BY product_id""")
             stock = query_df("""
@@ -141,6 +161,11 @@ class Store:
         self.brand = dict(zip(cat.product_id, cat.brand))
         self.price = dict(zip(cat.product_id, cat.price_eur.astype(float)))
         self.created = {p: to_epoch(c) for p, c in zip(cat.product_id, cat.created_at)}
+        self.attrs = {p: parse_attrs(d) for p, d in zip(cat.product_id, cat.description)}
+        self.by_attr_pair: dict[tuple, list[str]] = defaultdict(list)          # (a, b) -> products with both
+        for p, at in self.attrs.items():
+            if len(at) == 2:
+                self.by_attr_pair[at].append(p)
         for p, pr in self.price.items():
             self.base_price.setdefault(p, pr)                                   # new products: first price is the base
         self.unavailable = set(cat.product_id[~cat.is_active.astype(bool)]) | out
@@ -201,6 +226,24 @@ class Store:
         self.cs: dict[str, dict[str, list[float]]] = defaultdict(dict)
         for u, p, c, b in zip(df.u, df.p, df.c, df.b):
             self.cs[u][p] = [float(c), float(b)]
+
+    def _load_user_attrs(self, until: str | None) -> None:
+        """Events of each user per product attribute (organic history), and the overall share of each attribute."""
+        df = query_parts(f"""
+            SELECT e.user_id::String AS u, a AS attr, toUInt32(count()) AS n
+            FROM shop.history_events AS e
+            INNER JOIN (SELECT product_id::String AS p,
+                               arrayFilter(x -> position(description::String, x) > 0, {ATTR_SQL}) AS attrs
+                        FROM shop.catalog) AS i ON i.p = e.product_id::String
+            ARRAY JOIN i.attrs AS a
+            WHERE {{part}}{_until(until, 'e.ts')}
+            GROUP BY u, attr""", parts=4, key="e.user_id::String")
+        df = df.sort_values("u", kind="stable").reset_index(drop=True)
+        self.ua_index = _index(df.u.to_numpy())
+        self.ua_attr = df.attr.map(ATTR_INDEX).to_numpy(dtype=np.int64)
+        self.ua_n = df.n.to_numpy(dtype=np.float64)
+        base = np.bincount(self.ua_attr, weights=self.ua_n, minlength=len(ATTRIBUTES))
+        self.attr_base = base / max(base.sum(), 1.0)
 
     def load_popularity(self, until: str | None = None, live: bool = False) -> None:
         """Views / carts / purchases per product over the last POP_DAYS days, as shares (1.0 = average product)."""
@@ -282,11 +325,19 @@ class Store:
     # ------------------------------------------------------------------ live updates
     def ingest(self, events: Iterable) -> None:
         """Add organic events (user, product, event_type, count, last_ts) to the live tables."""
+        attrs = getattr(self, "attrs", {})
         for u, p, e, n, last in events:
             n, last = float(n), float(last)
             sc = self.subcat.get(p)
             if sc:
                 self.live_us[u][sc] += n
+            at = attrs.get(p)
+            if at:
+                vec = self.live_ua.get(u)
+                if vec is None:
+                    vec = self.live_ua[u] = np.zeros(len(ATTRIBUTES))
+                for a in at:
+                    vec[a] += n
             if e == "view":
                 if p in self.live_ui.get(u, {}):
                     self.live_ui[u][p][0] += n
@@ -314,6 +365,11 @@ class Store:
         if u.get("price_eur") is not None:
             self.price[p] = float(u["price_eur"])
             self.base_price.setdefault(p, float(u["price_eur"]))
+        if u.get("description") and hasattr(self, "attrs"):
+            at = parse_attrs(u["description"])
+            if p not in self.attrs and len(at) == 2:
+                self.by_attr_pair[at].append(p)
+            self.attrs[p] = at
         if change == "new_product":
             self.created[p] = to_epoch(u["created_at"]) if u.get("created_at") else time.time()
             items = self.products_by_subcat.setdefault(self.subcat[p], [])
@@ -345,6 +401,17 @@ class Store:
         n.update(self.live_us.get(user, {}))
         nb.update(self.live_us_buy.get(user, {}))
         return n, nb
+
+    def user_attrs(self, user: str) -> np.ndarray:
+        """Events of one user per attribute (history + live)."""
+        out = np.zeros(len(ATTRIBUTES))
+        s, e = self.ua_index.get(user, (0, 0))
+        if e > s:
+            np.add.at(out, self.ua_attr[s:e], self.ua_n[s:e])
+        live = self.live_ua.get(user)
+        if live is not None:
+            out += live
+        return out
 
     def user_brands(self, user: str) -> Counter:
         s, e = self.ub_index.get(user, (0, 0))
@@ -410,7 +477,7 @@ def heuristic_score(X: np.ndarray) -> np.ndarray:
 
 class Recommender:
     def __init__(self, store: Store, ranker: Ranker | None = None, n_candidates: int = 260,
-                 adjust: bool = False, wide: bool = True) -> None:
+                 adjust: bool = False, wide: bool = False) -> None:
         self.store = store
         self.ranker = ranker or Ranker()
         self.n_candidates = n_candidates
@@ -488,6 +555,10 @@ class Recommender:
         for sc, n in us.items():
             uc[s.cat_of_subcat.get(sc)] += n
         ub = s.user_brands(user)
+        ua = s.user_attrs(user)
+        ua_total = float(ua.sum())
+        lift = (ua / ua_total) / s.attr_base if ua_total >= 4 else np.ones(len(ATTRIBUTES))   # 1 = average shopper
+        v_attrs: Counter = Counter(a for p in views for a in s.attrs.get(p, ()))
         is_new = req.get("is_new_user")
         if is_new is None:            # history rows don't carry the flag: new = no organic history at all
             is_new = user not in s.us_index
@@ -498,6 +569,7 @@ class Recommender:
             "ui": s.user_items(user), "cs": s.carousel(user),
             "us": us, "us_total": float(sum(us.values())), "us_buy": us_buy, "us_buy_total": float(sum(us_buy.values())),
             "uc": uc, "ub": ub, "ub_total": float(sum(ub.values())),
+            "attr_lift": lift, "attr_total": ua_total, "v_attrs": v_attrs,
             "page": PAGES.get(req.get("page") or "", -1), "device": DEVICES.get(req.get("device") or "", -1),
             "region": REGIONS.get(req.get("region") or "", -1), "is_new_user": float(bool(is_new)),
         }
@@ -517,6 +589,13 @@ class Recommender:
 
         ui, cs = ctx["ui"], ctx["cs"]
         add(reversed(ctx["views"]), 20)                                                   # just viewed
+        pop_b = lambda p: -s.pop.get(p, (0, 0, 0))[2]  # noqa: E731
+        if ctx["attr_total"] >= 4:                       # products with the shopper's favourite attribute pairs
+            top = [int(a) for a in np.argsort(-ctx["attr_lift"])[:4]]
+            for pair in _pairs(top):
+                add(sorted(s.by_attr_pair.get(tuple(sorted(pair)), []), key=pop_b), 8)
+        for pair in _pairs([a for a, _ in ctx["v_attrs"].most_common(3)]):              # attributes being browsed
+            add(sorted(s.by_attr_pair.get(tuple(sorted(pair)), []), key=pop_b), 6)
         carted = [p for p in ui if ui[p][1] > 0 and ui[p][2] == 0]                       # in the cart, not bought
         add(sorted(carted, key=lambda p: -ui[p][3])[:40], 30)
         add(sorted((p for p in cs if cs[p][1] == 0), key=lambda p: -cs[p][0])[:20], 15)  # clicked in the carousel
@@ -565,6 +644,15 @@ class Recommender:
         us_total, us_buy_total, ub_total = ctx["us_total"], ctx["us_buy_total"], ctx["ub_total"]
         has_history = 1.0 if us_total > 0 else 0.0
         shown = s.shown.get(ctx["user"], {})
+        lift, v_attrs = ctx["attr_lift"], ctx["v_attrs"]
+
+        def attr_feats(p: str) -> tuple:
+            at = s.attrs.get(p, ())
+            if not at:
+                return 1.0, 1.0, 1.0, 0.0
+            ls = [float(lift[a]) for a in at]
+            match = sum(v_attrs.get(a, 0) for a in at) / max(n_views, 1)
+            return sum(ls) / len(ls), min(ls), max(ls), match
         for i, p in enumerate(cands):
             sc, cat, br = s.subcat.get(p), s.category.get(p), s.brand.get(p)
             ui = ctx["ui"].get(p)
@@ -600,9 +688,14 @@ class Recommender:
                 price / s.base_price.get(p, price) if price and s.base_price.get(p) else 1.0,
                 s.trend_sc.get(sc, 1.0),
                 shown.get(p, 0),
+                *attr_feats(p),
                 ctx["page"], ctx["device"], ctx["region"], ctx["is_new_user"],
             )
         return X
+
+
+def _pairs(items: list) -> list[tuple]:
+    return [(items[i], items[j]) for i in range(len(items)) for j in range(i + 1, len(items))]
 
 
 def request_from_row(row: Any) -> Record:

@@ -277,8 +277,8 @@ def _frac(ts: str) -> float:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--shadow", action="store_true", help="do not write submissions, only measure")
-    ap.add_argument("--version", default="v4", help="model_version written with each answer")
-    ap.add_argument("--model", default=str(ROOT / "models" / "ranker_v4.txt"))
+    ap.add_argument("--version", default="v5", help="model_version written with each answer")
+    ap.add_argument("--model", default=str(ROOT / "models" / "ranker_v5.txt"))
     ap.add_argument("--adjust", choices=["on", "off", "ab"], default="off",
                     help="live price-drop / trend multipliers: on, off, or A/B by user")
     ap.add_argument("--ab-candidates", action="store_true",
