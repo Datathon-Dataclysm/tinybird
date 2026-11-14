@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "skills": {
+    "rawtree": {
+      "source": "rawtreedb/agent-skills",
+      "sourceType": "github",
+      "skillPath": "skills/rawtree/SKILL.md",
+      "computedHash": "c69140fd29998b87f9fcb3e3724d691867041398464d1d2baccfef446f8d07a3"
+    }
+  }
+}
