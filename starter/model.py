@@ -131,12 +131,12 @@ class Store:
         """shop.catalog, plus (live) the latest shop.catalog_updates record of each product and the stock-outs."""
         cols = """product_id::String AS product_id, category::String AS category, subcategory::String AS subcategory,
                   is_active::Bool AS is_active, toString(created_at::DateTime64(3)) AS created_at,
-                  description::String AS description"""
+                  description::String AS description, price_eur::Float64 AS price"""
         if live:
             cat = query_df(f"""
                 SELECT product_id, argMax(category, v) AS category, argMax(subcategory, v) AS subcategory,
                        argMax(is_active, v) AS is_active, argMax(created_at, v) AS created_at,
-                       argMax(description, v) AS description
+                       argMax(description, v) AS description, argMax(price, v) AS price
                 FROM (SELECT {cols}, '' AS v FROM shop.catalog
                       UNION ALL SELECT {cols}, toString(ts::DateTime64(3)) AS v FROM shop.catalog_updates)
                 GROUP BY product_id""")
@@ -150,6 +150,7 @@ class Store:
         self.subcat = dict(zip(cat.product_id, cat.subcategory))
         self.category = dict(zip(cat.product_id, cat.category))
         self.created = {p: to_epoch(c) for p, c in zip(cat.product_id, cat.created_at)}
+        self.price = dict(zip(cat.product_id, cat.price.astype(float)))
         self.attrs = {p: parse_attrs(d) for p, d in zip(cat.product_id, cat.description)}
         self.cat_of_subcat = dict(zip(cat.subcategory, cat.category))
         self.by_attr_pair: dict[tuple, list[str]] = defaultdict(list)          # (a, b) -> products with both
@@ -332,6 +333,8 @@ class Store:
             self.attrs[p] = at
         if change == "new_product" and p not in self.by_subcat.get(self.subcat.get(p), []):
             self.by_subcat[self.subcat.get(p)].append(p)
+        if u.get("price_eur") is not None:
+            self.price[p] = float(u["price_eur"])
         if change == "new_product":
             self.created[p] = to_epoch(u["created_at"]) if u.get("created_at") else time.time()
         if change == "out_of_stock" or u.get("is_active") is False:
@@ -421,9 +424,12 @@ class Ranker:
 # ====================================================================================================== recommender
 class Recommender:
     def __init__(self, store: Store, ranker: Ranker | None = None, n_candidates: int = 400,
-                 n_retrieve: int = N_RETRIEVE) -> None:
+                 n_retrieve: int = N_RETRIEVE, price_tilt: float = 0.0) -> None:
         self.store = store
         self.ranker = ranker or Ranker()
+        # Rank by P(buy) x price^price_tilt. 0 = pure conversion (what is scored); 1 = expected revenue (the
+        # tie-breaker). In our carousel the buy rate is ~flat across price bands, so a small tilt costs little.
+        self.price_tilt = price_tilt
         self.n_candidates = n_candidates
         self.n_retrieve = n_retrieve
 
@@ -433,6 +439,9 @@ class Recommender:
             ctx = self.context(req)
             cands = self.candidates(ctx)
             scores = self.ranker.score(self.features(ctx, cands)) if cands else np.zeros(0)
+            if self.price_tilt and self.ranker.booster is not None and len(scores):
+                price = getattr(self.store, "price", {})
+                scores = scores * np.array([max(price.get(p, 30.0), 1.0) for p in cands]) ** self.price_tilt
             ranked = [cands[i] for i in np.argsort(-scores, kind="stable")]
             exclude = ctx["bought"]
         except Exception as e:  # never let one bad request break the batch

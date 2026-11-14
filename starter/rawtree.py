@@ -47,9 +47,16 @@ def query_parts(sql: str, parts: int, key: str = "user_id::String") -> pd.DataFr
     return pd.concat(frames, ignore_index=True)
 
 
-def insert(table: str, rows: list[Record], timeout: float = 10) -> None:
+def new_session() -> requests.Session:
+    """A separate HTTP session (one per thread that sends in parallel)."""
+    s = requests.Session()
+    s.headers["Authorization"] = http.headers["Authorization"]
+    return s
+
+
+def insert(table: str, rows: list[Record], timeout: float = 10, session: requests.Session | None = None) -> None:
     """Insert JSON rows into team_NN.<table>."""
-    r = http.post(f"{API}/v1/tables/{table}", params={"database": TEAM}, json=rows, timeout=timeout)
+    r = (session or http).post(f"{API}/v1/tables/{table}", params={"database": TEAM}, json=rows, timeout=timeout)
     r.raise_for_status()
 
 
