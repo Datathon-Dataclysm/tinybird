@@ -1,12 +1,14 @@
-
 IMAGE := datathon
-MODEL ?= woodcock
+MODEL ?= lynch-v8
 CONTAINER := recommender-$(MODEL)
 
-.PHONY: build run stop restart logs status remove
+.PHONY: build test run stop restart logs status remove
 
 build:
 	podman build -t $(IMAGE) .
+
+test:	# 2-minute shadow test of lynch-v8 (writes nothing)
+	podman run --rm --env-file .env $(IMAGE) lynch-v8-shadow
 
 run:
 	podman run -d \
