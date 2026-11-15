@@ -73,21 +73,23 @@ def fetch_live() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
                is_active::Bool AS is_active, toString(created_at::DateTime64(3)) AS created_at,
                toString(ts::DateTime64(3)) AS t
         FROM shop.catalog_updates ORDER BY ts""")
-    fb = query_df(f"""
+    # The feedback result outgrew RawTree's 100 MB response limit: fetch it in 4 parts (hash of request_id).
+    fb = pd.concat([query_df(f"""
         SELECT r.request_id AS request_id, r.ts AS ts, r.user_id AS user_id, r.is_new_user AS is_new_user,
                r.device AS device, r.region AS region, r.page AS page, r.recent_views AS recent_views,
                f.shown AS shown, f.clicked AS clicked, f.purchased AS purchased, f.fts AS fts,
                s.mv AS model_version
         FROM (SELECT request_id::String AS request_id, shown::Array(String) AS shown, clicked::String AS clicked,
                      purchased::String AS purchased, toString(ts::DateTime64(3)) AS fts
-              FROM {TEAM}.feedback WHERE request_id::String != '__init__') AS f
+              FROM {TEAM}.feedback WHERE request_id::String != '__init__'
+                AND cityHash64(request_id::String) % 4 = {k}) AS f
         INNER JOIN (SELECT request_id::String AS request_id, toString(ts::DateTime64(3)) AS ts, user_id::String AS user_id,
                            is_new_user::Bool AS is_new_user, context.device::String AS device,
                            context.region::String AS region, context.page::String AS page, recent_views
                     FROM shop.requests) AS r ON r.request_id = f.request_id
         LEFT JOIN (SELECT request_id::String AS request_id, any(model_version::String) AS mv
                    FROM {TEAM}.submissions GROUP BY request_id) AS s ON s.request_id = f.request_id
-        ORDER BY r.ts""")
+        ORDER BY r.ts""") for k in range(4)], ignore_index=True).sort_values("ts", kind="stable").reset_index(drop=True)
     return events, updates, fb
 
 
