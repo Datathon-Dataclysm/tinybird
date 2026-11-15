@@ -3,8 +3,10 @@
     python lynch/live.py                                        # shadow (default): compute and measure, write NOTHING
     python lynch/live.py --submit                               # production, lynch-v8
     python lynch/live.py --submit --version lynch-v9a --max-per-subcat 3       # production, lynch-v9a
-    python lynch/live.py --submit --ab lynch-v8=0,lynch-v9a=3   # A/B in ONE process: each version answers half of
-                                                                # the requests (version=max per subcategory, 0 = off)
+    python lynch/live.py --submit --version lynch-v9c --max-per-subcat 3 --price-tilt 0.05   # production, lynch-v9c
+    python lynch/live.py --submit --ab lynch-v8=0,lynch-v9a=3,lynch-v9c=3:0.05
+        # A/B in ONE process: each version answers an equal share of the requests
+        # (version=max per subcategory[:price tilt]; 0 = no cap)
 
 --- original v7 docstring ---
 Live recommender: the personalised model answering shop.requests in real time.
@@ -56,7 +58,8 @@ ORDER BY ts LIMIT 50000"""
 UPDATES = """
 SELECT product_id::String AS product_id, change::String AS change, category::String AS category,
        subcategory::String AS subcategory, is_active::Bool AS is_active, description::String AS description,
-       toString(created_at::DateTime64(3)) AS created_at, toString(ts::DateTime64(3)) AS t
+       toString(created_at::DateTime64(3)) AS created_at, price_eur::Float64 AS price_eur,
+       toString(ts::DateTime64(3)) AS t
 FROM shop.catalog_updates WHERE ts::DateTime64(3) > toDateTime64('{since}', 3) ORDER BY ts"""
 
 CAROUSEL = f"""
@@ -75,18 +78,20 @@ def _bucket(key: str, n: int) -> int:
 
 
 class Live:
-    def __init__(self, model_path: Path, versions: dict[str, int | None], shadow: bool, slot: int | None = None,
-                 slots: int = 5, salt: str = "spikes-v1") -> None:
-        """versions: model_version -> max products per subcategory (None = no cap). Two or more versions = an A/B
-        inside this process: same store, same model, each request answered by one version (hash of its id)."""
+    def __init__(self, model_path: Path, versions: dict[str, tuple[int | None, float]], shadow: bool,
+                 slot: int | None = None, slots: int = 5, salt: str = "spikes-v1") -> None:
+        """versions: model_version -> (max products per subcategory or None, price tilt). Two or more versions = an
+        A/B inside this process: same store, same model, each request answered by one version (hash of its id)."""
         self.versions, self.shadow, self.model_path = list(versions), shadow, model_path
         self.slot, self.slots, self.salt = slot, slots, salt     # concurrent A/B: answer only our hash slot
         log("loading store (history + today's events), ~2 min ...")
         self.store = Store.load(live=True)
         log(f"MF factors: {'loaded' if self.store.load_mf(MODELS / 'mf_v8.npz') else 'MISSING (mf features = 0)'}")
         ranker = Ranker.load(model_path) if model_path.exists() else Ranker()
-        self.recs = {v: Recommender(self.store, ranker, max_per_subcat=cap) for v, cap in versions.items()}
-        log("versions: " + ", ".join(f"{v} (max per subcategory: {cap or 'no cap'})" for v, cap in versions.items()))
+        self.recs = {v: Recommender(self.store, ranker, max_per_subcat=cap, price_tilt=tilt)
+                     for v, (cap, tilt) in versions.items()}
+        log("versions: " + ", ".join(f"{v} (max per subcategory: {cap or 'no cap'}, price tilt {tilt:g})"
+                                     for v, (cap, tilt) in versions.items()))
         self.model_mtime = model_path.stat().st_mtime if model_path.exists() else 0.0
         log(f"ranker: {model_path.name if model_path.exists() else 'hand-made score (no model file found)'}")
         self.lock = threading.Lock()              # the refresher mutates the store, the main loop reads it
@@ -240,13 +245,19 @@ def main() -> None:
     ap.add_argument("--slots", type=int, default=5, help="number of hash slots (must match the other harness)")
     ap.add_argument("--salt", default="spikes-v1", help="hash salt (must match the other harness)")
     ap.add_argument("--max-per-subcat", type=int, default=0, help="at most N products of one subcategory (0 = off)")
-    ap.add_argument("--ab", default="", help='A/B in this process, e.g. "lynch-v8=0,lynch-v9a=3" '
-                                             "(version=max per subcategory); replaces --version/--max-per-subcat")
+    ap.add_argument("--price-tilt", type=float, default=0.0, help="rank by score x price^tilt (0 = off)")
+    ap.add_argument("--ab", default="", help='A/B in this process, e.g. "lynch-v8=0,lynch-v9a=3,lynch-v9c=3:0.05" '
+                                             "(version=max per subcategory[:price tilt]); replaces --version, "
+                                             "--max-per-subcat and --price-tilt")
     args = ap.parse_args()
     if args.ab:
-        versions = {v.strip(): int(cap) or None for v, cap in (arm.split("=") for arm in args.ab.split(","))}
+        versions = {}
+        for arm in args.ab.split(","):
+            name, spec = arm.split("=")
+            cap, _, tilt = spec.partition(":")
+            versions[name.strip()] = (int(cap) or None, float(tilt or 0.0))
     else:
-        versions = {args.version: args.max_per_subcat or None}
+        versions = {args.version: (args.max_per_subcat or None, args.price_tilt)}
     if args.submit:
         be_first()                                   # answers before anything else running on this machine
     live = Live(Path(args.model), versions, shadow=not args.submit, slot=args.slot, slots=args.slots, salt=args.salt)

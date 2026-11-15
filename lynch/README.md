@@ -18,9 +18,17 @@ this replaces 0.7 of the 10 products on average). A request ends in at most one 
 compete for it. Evidence so far is mixed: on v9 (vulture, 00:15-01:01) the cap raised conversion 2.18 -> 2.39, mostly
 in cold requests; a 15-minute lynch test (01:50-02:05) went the other way, within noise. Hence the overnight A/B.
 
+## lynch-v9c = lynch-v9a + price tilt 0.05 (`--price-tilt 0.05`): rank by score x price^0.05
+The model has no price feature and under-predicts expensive products: on held-out live data, real/predicted purchases
+go 0.82 (cheapest fifth) -> 1.32 (most expensive fifth), i.e. purchases ~ price^0.16 (95% CI 0.10-0.22) beyond the
+model. A tilt of 0.05 changes 0.5 of the 10 products (0.2 in the top 3): EUR/request +11%, conversion -0.2% by the
+model alone, +1.1% once corrected with that calibration. Observational, hence also in the overnight A/B.
+
 Tried and dropped (not in the code): a cap per category (only 10 exist: it replaced 3 of the 10 products and was
-worse), a price tilt (more EUR, less conversion), one model per segment (cold-only / no-cold-only models were worse
-in their own segment; a 4-model blend gained < 0.5% MRR, within noise).
+worse), one model per segment (cold-only / no-cold-only models were worse in their own segment; a 4-model blend
+gained < 0.5% MRR, within noise).
+
+Sunday plan (A/B tonight, decision rule, retraining, final launch): `PLAN_DOMINGO.md`.
 
 ## A/B and reading it
 `--ab lynch-v8=0,lynch-v9a=3` runs both versions in ONE process (one store, one model): each request goes to one version
@@ -28,7 +36,7 @@ by a hash of its id, so both see the same shoppers at the same time and drift du
 compare versions that ran one after the other: the whole market moves ±10% from one hour to the next.
 
 `ab_report.py START [END]` reads the leaderboard API in 15-minute pieces and prints conversion, cold, no-cold and EUR per
-version, with each difference ± 2 SE. With ~2 h per arm, only differences above ~0.15-0.2 points are real.
+version, with each difference ± 2 SE. Overnight (3 arms, ~5 h), only differences above ~0.15-0.25 points are real.
 
 ## Windows note
 `/.gitattributes` keeps `models/*.txt` byte-exact and `Ranker.load` strips carriage returns: with `core.autocrlf=true`,
@@ -66,7 +74,8 @@ Shadow run against the live stream (6 min, 1,079 requests): **0 invalid**, ready
 ../.venv/bin/python lynch/live.py --minutes 5      # shadow test
 ../.venv/bin/python lynch/live.py --submit         # PRODUCTION (only one process per team!)
 ../.venv/bin/python lynch/live.py --submit --version lynch-v9a --max-per-subcat 3   # PRODUCTION, v9a
-../.venv/bin/python lynch/live.py --submit --ab lynch-v8=0,lynch-v9a=3             # A/B v8 vs v9a, one process
+../.venv/bin/python lynch/live.py --submit --version lynch-v9c --max-per-subcat 3 --price-tilt 0.05   # v9c
+../.venv/bin/python lynch/live.py --submit --ab lynch-v8=0,lynch-v9a=3,lynch-v9c=3:0.05   # A/B, one process
 ../.venv/bin/python lynch/ab_report.py 02:45 06:45                                 # read the A/B (local times)
 ```
 Rollback: stop `lynch/live.py --submit` and start v7's `starter/live.py --version v7` from origin/vulture.

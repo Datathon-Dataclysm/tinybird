@@ -165,12 +165,12 @@ class Store:
         """shop.catalog, plus (live) the latest shop.catalog_updates record of each product and the stock-outs."""
         cols = """product_id::String AS product_id, category::String AS category, subcategory::String AS subcategory,
                   is_active::Bool AS is_active, toString(created_at::DateTime64(3)) AS created_at,
-                  description::String AS description"""
+                  description::String AS description, price_eur::Float64 AS price"""
         if live:
             cat = query_df(f"""
                 SELECT product_id, argMax(category, v) AS category, argMax(subcategory, v) AS subcategory,
                        argMax(is_active, v) AS is_active, argMax(created_at, v) AS created_at,
-                       argMax(description, v) AS description
+                       argMax(description, v) AS description, argMax(price, v) AS price
                 FROM (SELECT {cols}, '' AS v FROM shop.catalog
                       UNION ALL SELECT {cols}, toString(ts::DateTime64(3)) AS v FROM shop.catalog_updates)
                 GROUP BY product_id""")
@@ -184,6 +184,7 @@ class Store:
         self.subcat = dict(zip(cat.product_id, cat.subcategory))
         self.category = dict(zip(cat.product_id, cat.category))
         self.created = {p: to_epoch(c) for p, c in zip(cat.product_id, cat.created_at)}
+        self.price = dict(zip(cat.product_id, cat.price.astype(float)))      # EUR, kept current by catalog updates
         self.attrs = {p: parse_attrs(d) for p, d in zip(cat.product_id, cat.description)}
         self.cat_of_subcat = dict(zip(cat.subcategory, cat.category))
         self.by_attr_pair: dict[tuple, list[str]] = defaultdict(list)          # (a, b) -> products with both
@@ -369,6 +370,8 @@ class Store:
             self.by_subcat[self.subcat.get(p)].append(p)
         if change == "new_product":
             self.created[p] = to_epoch(u["created_at"]) if u.get("created_at") else time.time()
+        if u.get("price_eur") is not None:
+            self.__dict__.setdefault("price", {})[p] = float(u["price_eur"])   # (stores pickled before prices existed)
         if change == "out_of_stock" or u.get("is_active") is False:
             self.unavailable.add(p)
         elif change in ("back_in_stock", "new_product"):
@@ -470,9 +473,14 @@ class Ranker:
 # ====================================================================================================== recommender
 class Recommender:
     def __init__(self, store: Store, ranker: Ranker | None = None, n_candidates: int = 400,
-                 n_retrieve: int = N_RETRIEVE, max_per_subcat: int | None = None) -> None:
+                 n_retrieve: int = N_RETRIEVE, max_per_subcat: int | None = None, price_tilt: float = 0.0) -> None:
         self.store = store
         self.ranker = ranker or Ranker()
+        # Rank by score x price^tilt (0 = off; lynch-v9c uses 0.05). The model has no price feature and under-predicts
+        # expensive products: on held-out live data, real/predicted purchases go 0.82 (cheapest fifth) -> 1.32 (most
+        # expensive fifth), i.e. purchases ~ price^0.16 (95% CI 0.10-0.22) beyond the model. Tilt 0.05 changes 0.5 of
+        # the 10 products: EUR +11%, conversion -0.2% by the model alone, +1.1% corrected with that calibration.
+        self.price_tilt = price_tilt
         # At most N products of one subcategory in the 10 (None = off; lynch-v9a uses 3); the rest move to the end.
         # A request ends in at most one purchase, so near-identical products compete for it. Live evidence is mixed
         # and within noise (see README: v9 2.18 -> 2.39, lynch 15 min the other way). A cap per CATEGORY (only 10
@@ -487,6 +495,9 @@ class Recommender:
             ctx = self.context(req)
             cands = self.candidates(ctx)
             scores = self.ranker.score(self.features(ctx, cands)) if cands else np.zeros(0)
+            if self.price_tilt and self.ranker.booster is not None and len(scores):
+                price = getattr(self.store, "price", {})
+                scores = scores * np.array([max(price.get(p, 30.0), 1.0) for p in cands]) ** self.price_tilt
             ranked = [cands[i] for i in np.argsort(-scores, kind="stable")]
             if self.max_per_subcat:
                 head, tail, used = [], [], Counter()
