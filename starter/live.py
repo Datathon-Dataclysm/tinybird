@@ -1,7 +1,7 @@
 """Live recommender: the personalised model answering shop.requests in real time.
 
-    python starter/live.py --version v8-name     # production: ranker_v8 + price tilt 0.2 (supervised: restarted
-                                                 # by itself if it dies or hangs)
+    python starter/live.py --version v13-swift   # production: ranker_v13 + price tilt 0.2 + max 3 per subcategory
+                                                 # (supervised: restarted by itself if it dies or hangs)
     python starter/live.py --shadow              # dry run: compute answers and measure, write NOTHING
 
 Reliability (10 points, and every late answer is served the fallback):
@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -127,14 +128,19 @@ class Live:
         # Every request goes to one arm by a hash of its id.
         self.models: dict[Path, list] = {}       # model file -> [ranker, mtime]
         self.arms: list[tuple[str, Recommender, Path]] = []
-        for name, tilt, path in arms:
+        for name, tilt, path, pin, cold, cap, cap_cat in arms:
             path = path or model_path
             if path not in self.models:
                 self.models[path] = [Ranker.load(path) if path.exists() else Ranker(),
                                      path.stat().st_mtime if path.exists() else 0.0]
-            self.arms.append((name, Recommender(self.store, self.models[path][0], price_tilt=tilt), path))
+            self.arms.append((name, Recommender(self.store, self.models[path][0], price_tilt=tilt, pin_viewed=pin,
+                                                cold_tilt=cold, max_per_subcat=cap, max_per_cat=cap_cat), path))
         self.rec = self.arms[0][1]
-        log("arms: " + ", ".join(f"{n} (price tilt {r.price_tilt:g}, model "
+        log("arms: " + ", ".join(f"{n} (price tilt {r.price_tilt:g}"
+                                 f"{'' if r.cold_tilt is None else f', cold requests {r.cold_tilt:g}'}"
+                                 f"{', pin viewed' if r.pin_viewed else ''}"
+                                 f"{f', max {r.max_per_subcat} per subcategory' if r.max_per_subcat else ''}"
+                                 f"{f', max {r.max_per_cat} per category' if r.max_per_cat else ''}, model "
                                  f"{p.name if p.exists() else 'hand-made score: no model file'})" for n, r, p in self.arms))
         self.lock = threading.Lock()              # the refresher mutates the store, the main loop reads it
         self.stats_lock = threading.Lock()
@@ -347,31 +353,44 @@ def supervise(argv: list[str], version: str) -> None:
         time.sleep(3)
 
 
-def _arm(spec: str) -> tuple[str, float, Path | None]:
+def _arm(spec: str) -> tuple[str, float, Path | None, bool, float | None, int | None, int | None]:
     """'v9a=0.2' or 'v9b=0.2@ranker_v9' -> (name, price tilt, model file or None = the default --model)."""
     name, _, rest = spec.partition("=")
+    rest, _, flags = rest.partition("+")
     tilt, _, model = rest.partition("@")
     model = model.strip()
     path = None
     if model:
         path = Path(model) if Path(model).is_absolute() else ROOT / "models" / (model if model.endswith(".txt") else model + ".txt")
-    return name.strip(), float(tilt or 0), path
+    tilt, _, cold = tilt.partition("/")                   # "0.2/0" = tilt 0.2, but 0 on cold requests
+    cap = re.search(r"cap(\d+)", flags)                   # "+cap3" = at most 3 products per subcategory
+    cat = re.search(r"cat(\d+)", flags)                   # "+cat4" = at most 4 products per category
+    return (name.strip(), float(tilt or 0), path, "pin" in flags, (float(cold) if cold.strip() else None),
+            int(cap.group(1)) if cap else None, int(cat.group(1)) if cat else None)
 
 
 def main() -> None:
     global _log_file
     ap = argparse.ArgumentParser()
     ap.add_argument("--shadow", action="store_true", help="do not write submissions, only measure")
-    ap.add_argument("--version", default="v8", help="model_version written with each answer")
+    ap.add_argument("--version", default="v13", help="model_version written with each answer")
     ap.add_argument("--price-tilt", type=float, default=0.2,
                     help="rank by P(buy) x price^tilt (0 = pure conversion; 0.2 = v8, won its A/B)")
-    ap.add_argument("--ab", default="", help='A/B arms "name=tilt,name=tilt@model_file": traffic split evenly by '
-                                             'request id; each arm can use its own file in models/')
-    ap.add_argument("--model", default=str(ROOT / "models" / "ranker_v8.txt"))
+    ap.add_argument("--cold-tilt", type=float, default=None,
+                    help="price tilt for cold requests only (new shopper / views with a new product); default = same")
+    ap.add_argument("--pin-viewed", action="store_true", help="put the best-scored just-viewed product in slot 1")
+    ap.add_argument("--max-per-cat", type=int, default=None, help="at most N products of one category in the 10")
+    ap.add_argument("--max-per-subcat", type=int, default=3,
+                    help="at most N products of one subcategory in the 10 (3 = v13, won its A/B; 0 = no limit)")
+    ap.add_argument("--ab", default="", help='A/B arms "name=tilt,name=tilt/cold_tilt@model_file+cap3+cat4": traffic split evenly '
+                                             'by request id; each arm can use its own file in models/ and +pin')
+    ap.add_argument("--model", default=str(ROOT / "models" / "ranker_v13.txt"))
     ap.add_argument("--child", action="store_true", help=argparse.SUPPRESS)   # started by the supervisor
     args = ap.parse_args()
-    arms = [_arm(a) for a in args.ab.split(",")] if args.ab else [(args.version, args.price_tilt, None)]
-    missing = [str(p) for _, _, p in arms if p is not None and not p.exists()]
+    arms = ([_arm(a) for a in args.ab.split(",")] if args.ab
+            else [(args.version, args.price_tilt, None, args.pin_viewed, args.cold_tilt, args.max_per_subcat or None,
+                   args.max_per_cat or None)])
+    missing = [str(a[2]) for a in arms if a[2] is not None and not a[2].exists()]
     if missing:
         sys.exit(f"model file not found: {', '.join(missing)}")
     name = "+".join(a[0] for a in arms)

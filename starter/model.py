@@ -145,8 +145,12 @@ class Store:
                 WHERE change::String IN ('out_of_stock', 'back_in_stock') GROUP BY product_id
                 HAVING argMax(change::String, ts::DateTime64(3)) = 'out_of_stock'""")
             out = set(stock.product_id) if len(stock) else set()
+            added = query_df("""SELECT DISTINCT product_id::String AS product_id FROM shop.catalog_updates
+                                WHERE change::String = 'new_product'""")
+            self.event_new = set(added.product_id) if len(added) else set()   # products added during the event
         else:
             cat, out = query_df(f"SELECT {cols} FROM shop.catalog"), set()
+            self.event_new = set()
         self.subcat = dict(zip(cat.product_id, cat.subcategory))
         self.category = dict(zip(cat.product_id, cat.category))
         self.created = {p: to_epoch(c) for p, c in zip(cat.product_id, cat.created_at)}
@@ -336,6 +340,7 @@ class Store:
         if u.get("price_eur") is not None:
             self.__dict__.setdefault("price", {})[p] = float(u["price_eur"])   # (stores cached before prices existed)
         if change == "new_product":
+            self.__dict__.setdefault("event_new", set()).add(p)
             self.created[p] = to_epoch(u["created_at"]) if u.get("created_at") else time.time()
         if change == "out_of_stock" or u.get("is_active") is False:
             self.unavailable.add(p)
@@ -424,12 +429,30 @@ class Ranker:
 # ====================================================================================================== recommender
 class Recommender:
     def __init__(self, store: Store, ranker: Ranker | None = None, n_candidates: int = 400,
-                 n_retrieve: int = N_RETRIEVE, price_tilt: float = 0.0) -> None:
+                 n_retrieve: int = N_RETRIEVE, price_tilt: float = 0.0, pin_viewed: bool = False,
+                 cold_tilt: float | None = None, max_per_subcat: int | None = None,
+                 max_per_cat: int | None = None) -> None:
         self.store = store
         self.ranker = ranker or Ranker()
         # Rank by P(buy) x price^price_tilt. 0 = pure conversion (what is scored); 1 = expected revenue (the
         # tie-breaker). In our carousel the buy rate is ~flat across price bands, so a small tilt costs little.
         self.price_tilt = price_tilt
+        # A different tilt for COLD requests (new shopper, or views that include a product added during the event:
+        # the organisers' definition, scored apart). Against the organisers' reference in the same hours, tilt 0.2
+        # cost ~4% of conversion overall but ~8% on cold: with little known about the shopper the scores are close
+        # together, so the price reorders much more. None = the same tilt for everybody.
+        self.cold_tilt = cold_tilt
+        # At most N products of the same subcategory in the 10. Each request ends in at most one purchase, so similar
+        # products compete: on held-out data, lists with 6-10 products of one subcategory sold 0.73x what the model
+        # predicted (4-5: 0.89x), while lists with <= 3 sold 1.08-1.10x. Extra products move to the end, not dropped.
+        self.max_per_subcat = max_per_subcat
+        # Same idea one level up: among lists that already had <= 3 per subcategory, those with <= 4 products of one
+        # CATEGORY sold 1.32-1.35x what the model predicted, those with 7-10 only 1.03x (held-out, 23,400 lists).
+        self.max_per_cat = max_per_cat
+        # pin_viewed puts the best-scored just-viewed product in slot 1. DO NOT USE: it looked good in the logs (a
+        # viewed product in slot 1 sold ~2x more) but only because the model put one there when it was sure (~8% of
+        # requests). Forced always (v10-kingfisher A/B), slot-1 purchases fell from ~11 to ~4 per 1000 requests.
+        self.pin_viewed = pin_viewed
         self.n_candidates = n_candidates
         self.n_retrieve = n_retrieve
 
@@ -439,15 +462,40 @@ class Recommender:
             ctx = self.context(req)
             cands = self.candidates(ctx)
             scores = self.ranker.score(self.features(ctx, cands)) if cands else np.zeros(0)
-            if self.price_tilt and self.ranker.booster is not None and len(scores):
+            tilt = self.price_tilt
+            if self.cold_tilt is not None and self.is_cold(ctx):
+                tilt = self.cold_tilt
+            if tilt and self.ranker.booster is not None and len(scores):
                 price = getattr(self.store, "price", {})
-                scores = scores * np.array([max(price.get(p, 30.0), 1.0) for p in cands]) ** self.price_tilt
+                scores = scores * np.array([max(price.get(p, 30.0), 1.0) for p in cands]) ** tilt
             ranked = [cands[i] for i in np.argsort(-scores, kind="stable")]
+            if self.pin_viewed and ctx["in_views"]:
+                best_viewed = next((p for p in ranked if p in ctx["in_views"] and p not in ctx["bought"]), None)
+                if best_viewed is not None and ranked[0] != best_viewed:
+                    ranked.remove(best_viewed)
+                    ranked.insert(0, best_viewed)
+            if self.max_per_subcat or self.max_per_cat:
+                cap_sc, cap_cat = self.max_per_subcat or 10, self.max_per_cat or 10
+                head, tail, used_sc, used_cat = [], [], Counter(), Counter()
+                for p in ranked:
+                    sc, c = self.store.subcat.get(p), self.store.category.get(p)
+                    if used_sc[sc] < cap_sc and used_cat[c] < cap_cat:
+                        head.append(p)
+                        used_sc[sc] += 1
+                        used_cat[c] += 1
+                    else:
+                        tail.append(p)
+                ranked = head + tail
             exclude = ctx["bought"]
         except Exception as e:  # never let one bad request break the batch
             print(f"recommend failed for {req.get('request_id')}: {e!r}")
             ranked, exclude = [], set()
         return self.fill(ranked, k, exclude)
+
+    def is_cold(self, ctx: dict[str, Any]) -> bool:
+        """The organisers' cold request: a new shopper, or recent views with a product added during the event."""
+        new = getattr(self.store, "event_new", ())
+        return bool(ctx["is_new_user"]) or any(p in new for p in ctx["views"])
 
     def fill(self, ranked: list[str], k: int = 10, exclude: set[str] = frozenset()) -> list[str]:
         """Keep valid items, then pad with best sellers so the answer always has k distinct products."""

@@ -41,6 +41,9 @@ models/*
 !models/ranker_v7.txt
 !models/ranker_v8.txt
 !models/ranker_v9.txt
+!models/ranker_v10.txt
+!models/ranker_v13.txt
+!models/ranker_v15.txt
 
 # --- Agent / editor local files (skills are reinstalled with: npx skills add rawtreedb/agent-skills) ---
 .agents/

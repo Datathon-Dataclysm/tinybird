@@ -2,6 +2,8 @@
 
     python tools/leaderboard.py            # last hour
     python tools/leaderboard.py 180        # last 3 hours (15 to 180 minutes)
+    python tools/leaderboard.py 00:10      # since 00:10 local time: use the time an A/B started, so that every
+                                           # arm is compared on exactly the same requests (max 3 h back)
 
 Conversion here is the organisers' EXPECTED conversion (each shopper's probability of buying what we showed), so it
 has no luck in it: the best way to compare versions. Compare versions that ran AT THE SAME TIME (A/B with
@@ -19,8 +21,17 @@ TEAM = "team_14"
 
 
 def main() -> None:
-    minutes = int(sys.argv[1]) if len(sys.argv) > 1 else 60
-    start = int(time.time() - 60 * min(max(minutes, 15), 180)) // 300 * 300
+    arg = sys.argv[1] if len(sys.argv) > 1 else "60"
+    if ":" in arg:                                   # a local clock time: the latest moment with that hh:mm
+        h, m = map(int, arg.split(":"))
+        now = time.localtime()
+        t = time.mktime((now.tm_year, now.tm_mon, now.tm_mday, h, m, 0, 0, 0, -1))
+        if t > time.time():
+            t -= 86400
+        start = int(max(t, time.time() - 3 * 3600))
+        start = (start + 299) // 300 * 300           # the API works in 5-minute steps
+    else:
+        start = int(time.time() - 60 * min(max(int(arg), 15), 180)) // 300 * 300
     d = json.load(urllib.request.urlopen(f"{API}&from={start}", timeout=20))
     hhmm = lambda t: time.strftime("%H:%M", time.localtime(t))  # noqa: E731
     print(f"window {hhmm(d['window'][0])}-{hhmm(d['window'][1])} (local time)\n")
