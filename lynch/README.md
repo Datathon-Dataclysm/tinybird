@@ -12,6 +12,28 @@ Evidence: `dataclysm/docs/experiments.md` (E1–E4 and the spike-s1…s4 feature
 | Model declares its own features; one builder computes all 31 | the same code serves v7-style and v8 models |
 | `live.py` is **shadow by default**; `--submit` writes | nothing is submitted by accident |
 
+## lynch-v9a = lynch-v8 + at most 3 products per subcategory (`--max-per-subcat 3`)
+Same model; only the order of the list changes (the 4th+ product of a subcategory moves to the end; on live requests
+this replaces 0.7 of the 10 products on average). A request ends in at most one purchase, so near-identical products
+compete for it. Evidence so far is mixed: on v9 (vulture, 00:15-01:01) the cap raised conversion 2.18 -> 2.39, mostly
+in cold requests; a 15-minute lynch test (01:50-02:05) went the other way, within noise. Hence the overnight A/B.
+
+Tried and dropped (not in the code): a cap per category (only 10 exist: it replaced 3 of the 10 products and was
+worse), a price tilt (more EUR, less conversion), one model per segment (cold-only / no-cold-only models were worse
+in their own segment; a 4-model blend gained < 0.5% MRR, within noise).
+
+## A/B and reading it
+`--ab lynch-v8=0,lynch-v9a=3` runs both versions in ONE process (one store, one model): each request goes to one version
+by a hash of its id, so both see the same shoppers at the same time and drift during the night cancels out. Do not
+compare versions that ran one after the other: the whole market moves ±10% from one hour to the next.
+
+`ab_report.py START [END]` reads the leaderboard API in 15-minute pieces and prints conversion, cold, no-cold and EUR per
+version, with each difference ± 2 SE. With ~2 h per arm, only differences above ~0.15-0.2 points are real.
+
+## Windows note
+`/.gitattributes` keeps `models/*.txt` byte-exact and `Ranker.load` strips carriage returns: with `core.autocrlf=true`,
+git used to check the model out with CRLF line endings and LightGBM failed ("Model format error, expect a tree here").
+
 ## Validation (train_v8.py, time split: train until 19:12 UTC, test 19:12–22:06 UTC, 653 test purchases)
 Reference = the v7 feature set retrained on the same data. 95% CIs from a paired request-level bootstrap.
 
@@ -43,5 +65,8 @@ Shadow run against the live stream (6 min, 1,079 requests): **0 invalid**, ready
 ../.venv/bin/python lynch/train_v8.py --final      # + retrain on all feedback -> models/ranker_v8.txt (+ .json); hot-reloaded by live.py
 ../.venv/bin/python lynch/live.py --minutes 5      # shadow test
 ../.venv/bin/python lynch/live.py --submit         # PRODUCTION (only one process per team!)
+../.venv/bin/python lynch/live.py --submit --version lynch-v9a --max-per-subcat 3   # PRODUCTION, v9a
+../.venv/bin/python lynch/live.py --submit --ab lynch-v8=0,lynch-v9a=3             # A/B v8 vs v9a, one process
+../.venv/bin/python lynch/ab_report.py 02:45 06:45                                 # read the A/B (local times)
 ```
 Rollback: stop `lynch/live.py --submit` and start v7's `starter/live.py --version v7` from origin/vulture.

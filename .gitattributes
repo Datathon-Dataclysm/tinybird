@@ -1,0 +1,5 @@
+# Trained models are data, not text: never convert their line endings.
+# On Windows (core.autocrlf=true) git would check them out with CRLF and LightGBM cannot read CRLF model files.
+models/*.txt -text
+lynch/models/*.txt -text
+lynch/models/*.json -text

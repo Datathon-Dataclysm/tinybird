@@ -449,7 +449,9 @@ class Ranker:
         """Model file + optional sidecar <name>.json {"new_boost": float} written by lynch/train_v8.py."""
         import json
         import lightgbm as lgb
-        booster = lgb.Booster(model_file=str(path))
+        # Read as text without carriage returns: on Windows, git (core.autocrlf) can check the .txt out with CRLF line
+        # endings and LightGBM then fails with "Model format error, expect a tree here" (see /.gitattributes).
+        booster = lgb.Booster(model_str=Path(path).read_text(encoding="utf-8").replace("\r", ""))
         side = Path(path).with_suffix(".json")
         boost = float(json.loads(side.read_text()).get("new_boost", 1.0)) if side.exists() else 1.0
         return cls(booster, boost)
@@ -468,9 +470,14 @@ class Ranker:
 # ====================================================================================================== recommender
 class Recommender:
     def __init__(self, store: Store, ranker: Ranker | None = None, n_candidates: int = 400,
-                 n_retrieve: int = N_RETRIEVE) -> None:
+                 n_retrieve: int = N_RETRIEVE, max_per_subcat: int | None = None) -> None:
         self.store = store
         self.ranker = ranker or Ranker()
+        # At most N products of one subcategory in the 10 (None = off; lynch-v9a uses 3); the rest move to the end.
+        # A request ends in at most one purchase, so near-identical products compete for it. Live evidence is mixed
+        # and within noise (see README: v9 2.18 -> 2.39, lynch 15 min the other way). A cap per CATEGORY (only 10
+        # exist) was worse: it replaced 3 of the 10 products.
+        self.max_per_subcat = max_per_subcat
         self.n_candidates = n_candidates
         self.n_retrieve = n_retrieve
 
@@ -481,6 +488,13 @@ class Recommender:
             cands = self.candidates(ctx)
             scores = self.ranker.score(self.features(ctx, cands)) if cands else np.zeros(0)
             ranked = [cands[i] for i in np.argsort(-scores, kind="stable")]
+            if self.max_per_subcat:
+                head, tail, used = [], [], Counter()
+                for p in ranked:
+                    sc = self.store.subcat.get(p)
+                    (head if used[sc] < self.max_per_subcat else tail).append(p)
+                    used[sc] += 1
+                ranked = head + tail
             exclude = ctx["bought"]
         except Exception as e:  # never let one bad request break the batch
             print(f"recommend failed for {req.get('request_id')}: {e!r}")
